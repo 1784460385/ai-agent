@@ -42,9 +42,9 @@ export function ChatInput({ disabled, loading, onSend, onStop }: Props) {
   };
 
   return (
-    <div className="sticky bottom-0 bg-gradient-to-t from-slate-50 via-slate-50 to-transparent px-4 pt-4 pb-6">
+    <div className="sticky bottom-0 bg-gradient-to-t from-slate-50 via-slate-50 to-transparent px-4 pt-4 pb-6 md:px-8">
       <form
-        className="mx-auto max-w-3xl rounded-2xl border border-slate-300 bg-white shadow-lg transition-all focus-within:ring-2 focus-within:ring-orange-500"
+        className="mx-auto w-full max-w-6xl rounded-2xl border border-slate-300 bg-white shadow-lg transition-all focus-within:ring-2 focus-within:ring-orange-500"
         onSubmit={(event) => {
           event.preventDefault();
           submit();
@@ -69,11 +69,11 @@ export function ChatInput({ disabled, loading, onSend, onStop }: Props) {
         )}
         <textarea
           value={draft}
-          rows={2}
+          rows={4}
           maxLength={4000}
           placeholder={disabled ? '请先在左侧保存 API Key' : '问一个知识库里可能有答案的问题'}
           aria-label="输入问题"
-          className="w-full resize-none border-0 bg-transparent p-4 text-sm outline-none"
+          className="w-full resize-none border-0 bg-transparent p-4 text-base outline-none"
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {

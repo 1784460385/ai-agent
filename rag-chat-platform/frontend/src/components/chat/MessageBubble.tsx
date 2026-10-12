@@ -27,7 +27,7 @@ export function MessageBubble({ message, streaming = false, debug = false }: Pro
           <Bot className="h-4 w-4" />
         </span>
       )}
-      <div className={isUser ? 'max-w-[85%]' : 'max-w-[85%] min-w-0 flex-1'}>
+      <div className={isUser ? 'max-w-[88%]' : 'max-w-[92%] min-w-0 flex-1'}>
         {!isUser && message.router && <RouterBadge router={message.router} />}
         <div
           className={

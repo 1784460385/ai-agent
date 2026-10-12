@@ -24,8 +24,8 @@ export function ChatWindow({ messages, isLoading, error, hasApiKey, debug, onSen
 
   return (
     <>
-      <div className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="mx-auto flex max-w-3xl flex-col gap-5">
+      <div className="flex-1 overflow-y-auto px-4 py-6 md:px-8">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-5">
           {messages.length === 0 && (
             <div className="mx-auto mt-16 max-w-xl rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
               <h2 className="text-2xl font-semibold text-slate-900">按文件夹检索，再回答</h2>
