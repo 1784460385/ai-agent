@@ -3,7 +3,6 @@ import threading
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-# Windows 上 Xet 大文件下载容易停在 0 字节，改走普通 HTTP。
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -11,11 +10,19 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 from config import CHROMA_PERSIST_DIR, COLLECTION_NAME, EMBEDDING_MODEL
+from folders import folder_map, list_folders
 
 _lock = threading.Lock()
 _model_lock = threading.Lock()
 _client: chromadb.PersistentClient | None = None
 _embedding_function = None
+
+
+def collection_name(folder_key: str) -> str:
+    folder = folder_map().get(folder_key)
+    if folder:
+        return folder["collection"]
+    return f"kb_{folder_key}"
 
 
 def get_chroma_client() -> chromadb.PersistentClient:
@@ -28,7 +35,7 @@ def get_chroma_client() -> chromadb.PersistentClient:
 
 
 def get_embedding_function():
-    """加载 Embedding 模型。首次调用会把模型下载到 backend/models。"""
+    """加载 Embedding 模型。首次调用会使用 backend/models 里的本地模型。"""
     global _embedding_function
     if _embedding_function is not None:
         return _embedding_function
@@ -43,36 +50,29 @@ def get_embedding_function():
     return _embedding_function
 
 
-def get_or_create_collection():
-    """获取或创建知识库集合。"""
-    client = get_chroma_client()
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
+def get_collection(dept: str):
+    """获取指定部门的 Collection。"""
+    return get_chroma_client().get_or_create_collection(
+        name=collection_name(dept),
         embedding_function=get_embedding_function(),
     )
 
 
-def collection_count() -> int:
-    """返回已索引片段数。集合不存在时返回 0，且不加载 Embedding 模型。"""
-    client = get_chroma_client()
+def department_count(dept: str) -> int:
+    """返回部门片段数。不存在时为 0，且不加载 Embedding 模型。"""
     try:
-        return client.get_collection(COLLECTION_NAME).count()
+        return get_chroma_client().get_collection(collection_name(dept)).count()
     except Exception:
         return 0
 
 
-def reset_collection():
-    """重建索引用：删掉旧集合，避免重复 id。"""
-    client = get_chroma_client()
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    return get_or_create_collection()
+def collection_count() -> int:
+    """返回全部文件夹的片段总数。"""
+    return sum(department_count(folder["key"]) for folder in list_folders())
 
 
-def _add(texts: list[str], ids: list[str], metadatas: list[dict] | None) -> None:
-    collection = get_or_create_collection()
+def _write(dept: str, texts: list[str], ids: list[str], metadatas: list[dict] | None) -> None:
+    collection = get_collection(dept)
     batch_size = 128
     for start in range(0, len(texts), batch_size):
         end = start + batch_size
@@ -83,61 +83,46 @@ def _add(texts: list[str], ids: list[str], metadatas: list[dict] | None) -> None
         )
 
 
-def add_documents(
-    texts: list[str],
-    ids: list[str],
-    metadatas: list[dict] | None = None,
-) -> int:
-    """将文本块存入向量库。"""
-    if not texts:
-        return 0
-    with _lock:
-        _add(texts, ids, metadatas)
-    return len(texts)
-
-
 def replace_documents(
+    dept: str,
     texts: list[str],
     ids: list[str],
     metadatas: list[dict] | None = None,
 ) -> int:
-    """清空后重建索引，避免重复 id，并与检索互斥。"""
-    if not texts:
-        return 0
-    get_embedding_function()
+    """清空该部门后重建索引。"""
+    if texts:
+        get_embedding_function()
     with _lock:
         client = get_chroma_client()
         try:
-            client.delete_collection(COLLECTION_NAME)
+            client.delete_collection(collection_name(dept))
         except Exception:
             pass
-        _add(texts, ids, metadatas)
+        if texts:
+            _write(dept, texts, ids, metadatas)
     return len(texts)
 
 
-def search(query_text: str, n_results: int = 3) -> list[dict]:
-    """检索最相关的文本块，附带来源元数据。"""
-    with _lock:
-        client = get_chroma_client()
-        try:
-            existing = client.get_collection(COLLECTION_NAME)
-        except Exception:
-            return []
-        count = existing.count()
-        if count == 0:
-            return []
+def delete_folder_collection(folder_key: str) -> None:
+    try:
+        get_chroma_client().delete_collection(collection_name(folder_key))
+    except Exception:
+        pass
 
-        collection = get_or_create_collection()
-        results = collection.query(
-            query_texts=[query_text],
-            n_results=min(n_results, count),
-            include=["documents", "metadatas", "distances"],
-        )
 
+def delete_legacy_collection() -> None:
+    try:
+        get_chroma_client().delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+
+
+def _hits_from_result(dept: str, results: dict) -> list[dict]:
     documents = (results.get("documents") or [[]])[0] or []
     metadatas = (results.get("metadatas") or [[]])[0] or []
     distances = (results.get("distances") or [[]])[0] or []
-
+    folder = folder_map().get(dept) or {}
+    dept_name = folder.get("name", dept)
     hits: list[dict] = []
     for index, content in enumerate(documents):
         if not content:
@@ -147,12 +132,48 @@ def search(query_text: str, n_results: int = 3) -> list[dict]:
             {
                 "content": content,
                 "source": meta.get("source") or "未知来源",
+                "department": dept,
+                "department_name": dept_name,
                 "distance": distances[index] if index < len(distances) else None,
             }
         )
     return hits
 
 
-def query_documents(query_text: str, n_results: int = 3) -> list[str]:
-    """检索最相关的文本块。"""
-    return [hit["content"] for hit in search(query_text, n_results=n_results)]
+def search_departments(departments: list[str], query_text: str, n_results: int = 3) -> list[dict]:
+    """从指定部门检索，每个部门最多返回 n_results 条。"""
+    with _lock:
+        client = get_chroma_client()
+        pending: list[tuple[str, int]] = []
+        for dept in departments:
+            if dept not in folder_map():
+                continue
+            try:
+                count = client.get_collection(collection_name(dept)).count()
+            except Exception:
+                continue
+            if count:
+                pending.append((dept, count))
+        if not pending:
+            return []
+
+        hits: list[dict] = []
+        for dept, count in pending:
+            collection = get_collection(dept)
+            results = collection.query(
+                query_texts=[query_text],
+                n_results=min(n_results, count),
+                include=["documents", "metadatas", "distances"],
+            )
+            hits.extend(_hits_from_result(dept, results))
+        return hits
+
+
+def query_documents(dept: str, query_text: str, n_results: int = 3) -> list[str]:
+    """从指定部门检索文本。"""
+    return [hit["content"] for hit in search_departments([dept], query_text, n_results)]
+
+
+def query_multiple_departments(departments: list[str], query_text: str, n_results: int = 3) -> list[str]:
+    """从多个部门检索并合并。"""
+    return [hit["content"] for hit in search_departments(departments, query_text, n_results)]

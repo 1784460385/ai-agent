@@ -1,52 +1,30 @@
-import os
+import threading
 from pathlib import Path
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import CHUNK_OVERLAP, CHUNK_SIZE, KNOWLEDGE_BASE_DIR
+from config import CHUNK_OVERLAP, CHUNK_SIZE
+from database import document_blobs
+from file_parsers import ParseError, load_bytes
+from folders import get_folder, list_folders
+from parse_status import set_status
 
-TEXT_SUFFIXES = {".txt", ".md", ".markdown"}
 
-
-def _load_text(path: Path):
-    last_error: Exception | None = None
-    for encoding in ("utf-8", "utf-8-sig", "gbk"):
+def _load_stored_documents(folder_key: str) -> tuple[list, dict[str, str], list[str]]:
+    documents = []
+    errors: dict[str, str] = {}
+    names: list[str] = []
+    for filename, payload in document_blobs(folder_key):
+        names.append(filename)
         try:
-            return TextLoader(str(path), encoding=encoding).load()
+            documents.extend(load_bytes(filename, payload))
+        except ParseError as exc:
+            errors[filename] = str(exc)
+            print(f"[WARN] 加载 {filename} 失败: {exc}")
         except Exception as exc:
-            last_error = exc
-    raise RuntimeError(last_error or f"无法读取 {path.name}")
-
-
-def load_and_split_documents():
-    """加载知识库目录下所有文档并分块。"""
-    os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
-    all_docs = []
-    root = Path(KNOWLEDGE_BASE_DIR)
-
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        suffix = path.suffix.lower()
-        try:
-            if suffix == ".pdf":
-                all_docs.extend(PyPDFLoader(str(path)).load())
-            elif suffix in TEXT_SUFFIXES:
-                all_docs.extend(_load_text(path))
-        except Exception as exc:
-            print(f"[WARN] 加载 {path.name} 失败: {exc}")
-
-    if not all_docs:
-        return []
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", "。", "！", "？", " ", ""],
-        length_function=len,
-    )
-    return splitter.split_documents(all_docs)
+            errors[filename] = f"解析失败：{exc}"
+            print(f"[WARN] 加载 {filename} 失败: {exc}")
+    return documents, errors, names
 
 
 def _source_label(metadata: dict) -> str:
@@ -60,41 +38,123 @@ def _source_label(metadata: dict) -> str:
         return source
 
 
-def index_knowledge_base():
-    """执行完整的索引流程：加载 → 分块 → 向量化 → 存储。"""
-    from vector_store import replace_documents
+def load_and_split_documents(only_department: str | None = None) -> dict:
+    """按数据库中的原文分别加载和分块。"""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", "。", "！", "？", " ", ""],
+        length_function=len,
+    )
+    selected = [only_department] if only_department else [folder["key"] for folder in list_folders()]
+    dept_chunks: dict = {}
 
-    chunks = load_and_split_documents()
-    if not chunks:
+    for dept in selected:
+        if get_folder(dept) is None:
+            continue
+        documents, errors, names = _load_stored_documents(dept)
+        _record_parse_results(dept, names, errors)
+        if not documents:
+            dept_chunks[dept] = []
+            continue
+        dept_chunks[dept] = splitter.split_documents(documents)
+    return dept_chunks
+
+
+def _record_parse_results(dept: str, names: list[str], errors: dict[str, str]) -> None:
+    for name in names:
+        if name in errors:
+            set_status(dept, name, "failed", errors[name])
+        else:
+            set_status(dept, name, "indexed")
+
+
+def index_knowledge_base(only_department: str | None = None):
+    """按部门分别索引。"""
+    from vector_store import delete_legacy_collection, replace_documents
+
+    dept_chunks = load_and_split_documents(only_department)
+    if not dept_chunks:
         return {"status": "empty", "message": "知识库目录为空或无支持的文档"}
 
-    texts: list[str] = []
-    ids: list[str] = []
-    metadatas: list[dict] = []
-    for chunk in chunks:
-        content = chunk.page_content.strip()
-        if not content:
-            continue
-        texts.append(content)
-        ids.append(f"chunk_{len(ids)}")
-        metadatas.append({"source": _source_label(chunk.metadata), "chunk": len(ids) - 1})
+    if only_department is None:
+        delete_legacy_collection()
 
-    if not texts:
-        return {"status": "empty", "message": "文档中没有可索引的文本"}
+    counts: dict[str, int] = {}
+    total = 0
+    for dept, chunks in dept_chunks.items():
+        texts: list[str] = []
+        ids: list[str] = []
+        metadatas: list[dict] = []
+        dept_name = (get_folder(dept) or {}).get("name", dept)
+        for chunk in chunks:
+            content = chunk.page_content.strip()
+            if not content:
+                continue
+            label = f"{dept_name}/{_source_label(chunk.metadata)}"
+            texts.append(content)
+            ids.append(f"{dept}_chunk_{len(ids)}")
+            metadatas.append({"source": label, "department": dept, "chunk": len(ids) - 1})
+        count = replace_documents(dept, texts, ids, metadatas)
+        counts[dept] = count
+        total += count
+        print(f"[INDEX] {dept}: 索引了 {count} 个片段")
 
-    count = replace_documents(texts, ids, metadatas)
-    return {"status": "ok", "chunks_indexed": count}
+    if total == 0:
+        return {"status": "empty", "message": "知识库目录为空或无支持的文档", "departments": counts}
+    return {"status": "ok", "chunks_indexed": total, "departments": counts}
+
+
+def ingest_saved_file(department: str, filename: str) -> None:
+    """先在时限内解析数据库中的原文，成功后再重建该部门索引。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    from config import PARSE_TIMEOUT_SECONDS
+    from database import read_document_bytes
+    from file_parsers import ParseError, load_bytes
+
+    payload = read_document_bytes(department, filename)
+    if payload is None:
+        set_status(department, filename, "failed", "文件不存在")
+        return
+    set_status(department, filename, "parsing")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(load_bytes, filename, payload)
+            future.result(timeout=PARSE_TIMEOUT_SECONDS)
+    except FuturesTimeout:
+        set_status(department, filename, "failed", "解析超时")
+        return
+    except ParseError as exc:
+        set_status(department, filename, "failed", str(exc))
+        return
+    except Exception as exc:
+        set_status(department, filename, "failed", f"解析失败：{exc}")
+        return
+
+    with _ingest_lock:
+        try:
+            index_knowledge_base(department)
+        except Exception as exc:
+            set_status(department, filename, "failed", f"索引失败：{exc}")
+
+
+_ingest_lock = threading.Lock()
+
+
+NO_KB_NOTICE = "知识库中没有可引用的内容，以下由模型自行生成，请自行判断准确性。"
 
 
 def build_rag_prompt(user_question: str, retrieved_docs: list[str]) -> str:
     """构建增强 Prompt。"""
     context = "\n\n---\n\n".join(retrieved_docs) if retrieved_docs else "（知识库中没有检索到相关内容）"
-    return f"""你是一个知识库助手。请严格根据以下提供的上下文信息来回答用户问题。
+    return f"""你是一个知识库助手。优先根据上下文回答；上下文没有依据时，再用你自己的知识回答。
 
 规则：
-1. 仅使用上下文中明确出现的信息作答。
-2. 如果上下文信息不足以回答问题，请如实告知用户"根据现有知识库，我无法回答这个问题"。
-3. 回答时请标注信息来源（如果上下文中包含来源标识）。
+1. 如果上下文里有能直接回答问题的信息，只使用这些信息作答，并标注来源。
+2. 如果上下文为空、与问题无关，或不足以回答问题，不要拒答，不要罗列知识库里有哪些无关资料。请用你自己的知识完整回答，并且回答的第一句必须原样写出：{NO_KB_NOTICE}
+3. 自行生成时不要把上下文说成来源，也不要编造知识库里不存在的出处。
 
 ## 上下文信息
 {context}

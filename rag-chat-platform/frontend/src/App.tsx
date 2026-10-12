@@ -1,44 +1,41 @@
-import { useState } from 'react';
-import { ApiKeyPanel } from './components/ApiKeyPanel';
-import { ChatWindow } from './components/ChatWindow';
-import { KnowledgeUpload } from './components/KnowledgeUpload';
-import { useChat } from './hooks/useChat';
+import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
+import { AuthProvider } from './auth/AuthContext';
+import { Navbar } from './components/layout/Navbar';
+import { AdminRoute, PrivateRoute } from './components/PrivateRoute';
+import { AdminUsersPage } from './pages/AdminUsersPage';
+import { ChatPage } from './pages/ChatPage';
+import { HistoryPage } from './pages/HistoryPage';
+import { KnowledgePage } from './pages/KnowledgePage';
+import { LoginPage } from './pages/LoginPage';
+
+function Shell() {
+  return (
+    <div className="flex h-screen flex-col bg-slate-50 font-sans text-slate-800">
+      <Navbar />
+      <div className="min-h-0 flex-1">
+        <Outlet />
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
-  const [apiKey, setApiKey] = useState('');
-  const [modelName, setModelName] = useState('deepseek-flash');
-  const chat = useChat(apiKey, modelName);
-
   return (
-    <div className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="mark" aria-hidden="true" />
-          <div>
-            <strong>星澜</strong>
-            <p>RAG 问答台</p>
-          </div>
-        </div>
-        <ApiKeyPanel
-          saved={Boolean(apiKey)}
-          modelName={modelName}
-          onSave={(key, model) => {
-            setApiKey(key);
-            setModelName(model);
-          }}
-        />
-        <KnowledgeUpload />
-      </aside>
-      <main>
-        <ChatWindow
-          messages={chat.messages}
-          isLoading={chat.isLoading}
-          error={chat.error}
-          hasApiKey={Boolean(apiKey)}
-          onSend={chat.sendMessage}
-          onStop={chat.stop}
-        />
-      </main>
-    </div>
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route element={<PrivateRoute />}>
+          <Route element={<Shell />}>
+            <Route path="/" element={<Navigate to="/chat" replace />} />
+            <Route path="/chat" element={<ChatPage />} />
+            <Route path="/knowledge" element={<KnowledgePage />} />
+            <Route path="/history" element={<HistoryPage />} />
+            <Route element={<AdminRoute />}>
+              <Route path="/admin/users" element={<AdminUsersPage />} />
+            </Route>
+          </Route>
+        </Route>
+      </Routes>
+    </AuthProvider>
   );
 }

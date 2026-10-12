@@ -1,4 +1,7 @@
 import { createParser, type EventSourceMessage } from 'eventsource-parser';
+import { ApiError, http, TOKEN_KEY, clearSession } from './http';
+
+export { ApiError };
 
 export interface ModelConfig {
   api_key: string;
@@ -9,7 +12,15 @@ export interface ModelConfig {
 export interface SourceItem {
   index: number;
   source: string;
+  department?: string;
+  department_name?: string;
   preview: string;
+  excerpt?: string;
+}
+
+export interface RouterInfo {
+  via: 'rule' | 'llm';
+  departments: { key: string; name: string }[];
 }
 
 export interface IndexResponse {
@@ -21,22 +32,61 @@ export interface IndexResponse {
 export interface DocumentInfo {
   name: string;
   size: number;
+  department?: string;
+  parse_status?: string | null;
+  parse_error?: string | null;
+}
+
+export interface FormatInfo {
+  ext: string;
+  label: string;
+  max_mb: number;
+}
+
+export interface AppConfig {
+  formats: FormatInfo[];
+  coming_soon: string[];
+  accept: string;
+}
+
+export interface DepartmentInfo {
+  key: string;
+  name: string;
+  description: string;
+  chunk_count: number;
+  files: DocumentInfo[];
+}
+
+export interface HistoryItem {
+  id: number;
+  question: string;
+  answer?: string;
+  citations?: { file: string; snippet: string }[];
+  router_departments: string[];
+  created_at: string;
+}
+
+export interface HistoryPageResult {
+  total: number;
+  page: number;
+  size: number;
+  items: HistoryItem[];
+}
+
+export interface AccountUser {
+  id: number;
+  username: string;
+  role: 'admin' | 'user';
+  is_active: boolean;
+  created_at: string;
 }
 
 export type ChatEvent =
+  | { type: 'router'; via: 'rule' | 'llm'; departments: { key: string; name: string }[] }
   | { type: 'sources'; sources: SourceItem[] }
   | { type: 'delta'; content: string }
   | { type: 'done' }
   | { type: 'error'; message: string };
-
-export class ApiError extends Error {
-  status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
 
 async function readError(response: Response, fallback: string): Promise<string> {
   try {
@@ -52,40 +102,96 @@ async function readError(response: Response, fallback: string): Promise<string> 
   return fallback;
 }
 
-export async function uploadDocument(file: File): Promise<{ status: string; filename: string }> {
-  const form = new FormData();
-  form.append('file', file);
-  const response = await fetch('/api/upload', { method: 'POST', body: form });
-  if (!response.ok) {
-    throw new ApiError(response.status, await readError(response, '上传失败'));
-  }
-  return response.json();
+export async function createFolder(name: string): Promise<{ key: string; name: string }> {
+  const { data } = await http.post('/api/folders', { name });
+  return data;
 }
 
-export async function rebuildIndex(): Promise<IndexResponse> {
-  const response = await fetch('/api/index', { method: 'POST' });
-  if (!response.ok) {
-    throw new ApiError(response.status, await readError(response, '索引失败'));
-  }
-  return response.json();
+export async function deleteFolder(folderKey: string): Promise<void> {
+  await http.delete(`/api/folders/${encodeURIComponent(folderKey)}`);
+}
+
+export async function fetchConfig(): Promise<AppConfig> {
+  const { data } = await http.get('/api/config');
+  return data;
+}
+
+export async function retryParse(department: string, filename: string): Promise<void> {
+  await http.post(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/retry`);
+}
+
+export async function uploadDocument(
+  file: File,
+  department: string
+): Promise<{ status: string; filename: string; department: string }> {
+  const form = new FormData();
+  form.append('department', department);
+  form.append('file', file);
+  const { data } = await http.post('/api/upload', form);
+  return data;
+}
+
+export async function deleteDocument(department: string, filename: string): Promise<void> {
+  await http.delete(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}`);
+}
+
+export async function rebuildIndex(department?: string): Promise<IndexResponse> {
+  const { data } = await http.post('/api/index', null, { params: department ? { department } : {} });
+  return data;
+}
+
+export async function listDepartments(): Promise<DepartmentInfo[]> {
+  const { data } = await http.get('/api/departments');
+  return data.departments ?? [];
 }
 
 export async function listDocuments(): Promise<DocumentInfo[]> {
-  const response = await fetch('/api/documents');
-  if (!response.ok) {
-    throw new ApiError(response.status, await readError(response, '无法读取知识库'));
-  }
-  const body = await response.json();
-  return body.files ?? [];
+  const { data } = await http.get('/api/documents');
+  return data.files ?? [];
 }
 
 export async function fetchStats(): Promise<number> {
-  const response = await fetch('/api/stats');
-  if (!response.ok) {
-    throw new ApiError(response.status, '无法读取索引状态');
-  }
-  const body = await response.json();
-  return body.chunks ?? 0;
+  const { data } = await http.get('/api/stats');
+  return data.chunks ?? 0;
+}
+
+export async function listHistory(page: number, size: number, keyword: string): Promise<HistoryPageResult> {
+  const { data } = await http.get('/api/history', { params: { page, size, keyword: keyword || undefined } });
+  return data;
+}
+
+export async function deleteHistory(id: number): Promise<void> {
+  await http.delete(`/api/history/${id}`);
+}
+
+export async function clearHistory(): Promise<void> {
+  await http.delete('/api/history');
+}
+
+export async function listUsers(page: number, size = 20): Promise<{ total: number; page: number; size: number; items: AccountUser[] }> {
+  const { data } = await http.get('/api/admin/users', { params: { page, size } });
+  return data;
+}
+
+export async function createUser(payload: { username: string; password: string; role: 'admin' | 'user' }): Promise<AccountUser> {
+  const { data } = await http.post('/api/admin/users', payload);
+  return data;
+}
+
+export async function updateUser(
+  id: number,
+  payload: { role?: 'admin' | 'user'; is_active?: boolean; password?: string }
+): Promise<AccountUser> {
+  const { data } = await http.put(`/api/admin/users/${id}`, payload);
+  return data;
+}
+
+export async function deleteUser(id: number): Promise<void> {
+  await http.delete(`/api/admin/users/${id}`);
+}
+
+export async function changePassword(oldPassword: string, newPassword: string): Promise<void> {
+  await http.post('/api/auth/change-password', { old_password: oldPassword, new_password: newPassword });
 }
 
 export async function streamChat(
@@ -94,16 +200,25 @@ export async function streamChat(
   signal: AbortSignal,
   onEvent: (event: ChatEvent) => void
 ): Promise<void> {
+  const token = localStorage.getItem(TOKEN_KEY);
   const response = await fetch('/api/chat', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({ message, config }),
     signal,
   });
 
   if (!response.ok) {
-    const fallback = response.status === 401 ? 'API Key 无效或未授权' : `请求失败 (${response.status})`;
-    throw new ApiError(response.status, await readError(response, fallback));
+    const fallback = response.status === 401 ? '登录已失效，请重新登录' : `请求失败 (${response.status})`;
+    const messageText = await readError(response, fallback);
+    if (response.status === 401 && (messageText.includes('凭证') || messageText.includes('禁用') || messageText.includes('不存在'))) {
+      clearSession();
+      window.location.assign('/login');
+    }
+    throw new ApiError(response.status, messageText);
   }
 
   const reader = response.body?.getReader();
