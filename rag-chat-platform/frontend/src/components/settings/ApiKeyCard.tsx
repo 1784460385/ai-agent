@@ -23,7 +23,7 @@ export function ApiKeyCard({ saved, modelName, onSave }: Props) {
     }
     onSave(next, model);
     setKey('');
-    setHint('已保存在本次浏览器会话中，关闭标签页后需要重新输入');
+    setHint('只对当前登录账号有效，切换账号后需要重新填写');
   };
 
   return (

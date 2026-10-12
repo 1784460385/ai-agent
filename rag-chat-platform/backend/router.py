@@ -7,9 +7,9 @@ from config import DEEPSEEK_BASE_URL, DEFAULT_MODEL
 from folders import folder_map
 
 
-def rule_based_route(query: str) -> list[str] | None:
+def rule_based_route(query: str, user_id: int) -> list[str] | None:
     """基于关键词的快速路由。未命中时返回 None。"""
-    catalog = folder_map()
+    catalog = folder_map(user_id)
     matched: list[str] = []
     for dept_key, dept_info in catalog.items():
         for keyword in dept_info.get("keywords", []):
@@ -27,9 +27,9 @@ def _safe_error(exc: Exception, api_key: str) -> str:
     return text[:300]
 
 
-async def llm_based_route(query: str, api_key: str, base_url: str, model: str) -> list[str]:
+async def llm_based_route(query: str, api_key: str, base_url: str, model: str, user_id: int) -> list[str]:
     """调用 DeepSeek 判断部门。失败时回退到全部部门。"""
-    catalog = folder_map()
+    catalog = folder_map(user_id)
     if not catalog:
         return []
     descriptions = "\n".join(
@@ -75,14 +75,14 @@ async def llm_based_route(query: str, api_key: str, base_url: str, model: str) -
         return list(catalog.keys())
 
 
-async def route_query(query: str, api_key: str, base_url: str, model: str) -> tuple[list[str], str]:
+async def route_query(query: str, api_key: str, base_url: str, model: str, user_id: int) -> tuple[list[str], str]:
     """先规则，未命中再调用 LLM。返回 (部门列表, rule|llm)。"""
-    rule_result = rule_based_route(query)
+    rule_result = rule_based_route(query, user_id)
     if rule_result:
         print(f"[ROUTER] 规则命中: {rule_result}")
         return rule_result, "rule"
 
     print("[ROUTER] 规则未命中，调用 LLM 兜底...")
-    llm_result = await llm_based_route(query, api_key, base_url, model)
+    llm_result = await llm_based_route(query, api_key, base_url, model, user_id)
     print(f"[ROUTER] LLM 路由结果: {llm_result}")
     return llm_result, "llm"

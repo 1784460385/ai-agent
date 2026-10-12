@@ -10,11 +10,11 @@ from folders import get_folder, list_folders
 from parse_status import set_status
 
 
-def _load_stored_documents(folder_key: str) -> tuple[list, dict[str, str], list[str]]:
+def _load_stored_documents(user_id: int, folder_key: str) -> tuple[list, dict[str, str], list[str]]:
     documents = []
     errors: dict[str, str] = {}
     names: list[str] = []
-    for filename, payload in document_blobs(folder_key):
+    for filename, payload in document_blobs(user_id, folder_key):
         names.append(filename)
         try:
             documents.extend(load_bytes(filename, payload))
@@ -38,7 +38,7 @@ def _source_label(metadata: dict) -> str:
         return source
 
 
-def load_and_split_documents(only_department: str | None = None) -> dict:
+def load_and_split_documents(user_id: int, only_department: str | None = None) -> dict:
     """按数据库中的原文分别加载和分块。"""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -46,14 +46,14 @@ def load_and_split_documents(only_department: str | None = None) -> dict:
         separators=["\n\n", "\n", "。", "！", "？", " ", ""],
         length_function=len,
     )
-    selected = [only_department] if only_department else [folder["key"] for folder in list_folders()]
+    selected = [only_department] if only_department else [folder["key"] for folder in list_folders(user_id)]
     dept_chunks: dict = {}
 
     for dept in selected:
-        if get_folder(dept) is None:
+        if get_folder(user_id, dept) is None:
             continue
-        documents, errors, names = _load_stored_documents(dept)
-        _record_parse_results(dept, names, errors)
+        documents, errors, names = _load_stored_documents(user_id, dept)
+        _record_parse_results(user_id, dept, names, errors)
         if not documents:
             dept_chunks[dept] = []
             continue
@@ -61,19 +61,19 @@ def load_and_split_documents(only_department: str | None = None) -> dict:
     return dept_chunks
 
 
-def _record_parse_results(dept: str, names: list[str], errors: dict[str, str]) -> None:
+def _record_parse_results(user_id: int, dept: str, names: list[str], errors: dict[str, str]) -> None:
     for name in names:
         if name in errors:
-            set_status(dept, name, "failed", errors[name])
+            set_status(user_id, dept, name, "failed", errors[name])
         else:
-            set_status(dept, name, "indexed")
+            set_status(user_id, dept, name, "indexed")
 
 
-def index_knowledge_base(only_department: str | None = None):
+def index_knowledge_base(user_id: int, only_department: str | None = None):
     """按部门分别索引。"""
     from vector_store import delete_legacy_collection, replace_documents
 
-    dept_chunks = load_and_split_documents(only_department)
+    dept_chunks = load_and_split_documents(user_id, only_department)
     if not dept_chunks:
         return {"status": "empty", "message": "知识库目录为空或无支持的文档"}
 
@@ -86,7 +86,7 @@ def index_knowledge_base(only_department: str | None = None):
         texts: list[str] = []
         ids: list[str] = []
         metadatas: list[dict] = []
-        dept_name = (get_folder(dept) or {}).get("name", dept)
+        dept_name = (get_folder(user_id, dept) or {}).get("name", dept)
         for chunk in chunks:
             content = chunk.page_content.strip()
             if not content:
@@ -95,7 +95,7 @@ def index_knowledge_base(only_department: str | None = None):
             texts.append(content)
             ids.append(f"{dept}_chunk_{len(ids)}")
             metadatas.append({"source": label, "department": dept, "chunk": len(ids) - 1})
-        count = replace_documents(dept, texts, ids, metadatas)
+        count = replace_documents(user_id, dept, texts, ids, metadatas)
         counts[dept] = count
         total += count
         print(f"[INDEX] {dept}: 索引了 {count} 个片段")
@@ -105,7 +105,7 @@ def index_knowledge_base(only_department: str | None = None):
     return {"status": "ok", "chunks_indexed": total, "departments": counts}
 
 
-def ingest_saved_file(department: str, filename: str) -> None:
+def ingest_saved_file(user_id: int, department: str, filename: str) -> None:
     """先在时限内解析数据库中的原文，成功后再重建该部门索引。"""
     from concurrent.futures import ThreadPoolExecutor
     from concurrent.futures import TimeoutError as FuturesTimeout
@@ -114,30 +114,30 @@ def ingest_saved_file(department: str, filename: str) -> None:
     from database import read_document_bytes
     from file_parsers import ParseError, load_bytes
 
-    payload = read_document_bytes(department, filename)
+    payload = read_document_bytes(user_id, department, filename)
     if payload is None:
-        set_status(department, filename, "failed", "文件不存在")
+        set_status(user_id, department, filename, "failed", "文件不存在")
         return
-    set_status(department, filename, "parsing")
+    set_status(user_id, department, filename, "parsing")
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(load_bytes, filename, payload)
             future.result(timeout=PARSE_TIMEOUT_SECONDS)
     except FuturesTimeout:
-        set_status(department, filename, "failed", "解析超时")
+        set_status(user_id, department, filename, "failed", "解析超时")
         return
     except ParseError as exc:
-        set_status(department, filename, "failed", str(exc))
+        set_status(user_id, department, filename, "failed", str(exc))
         return
     except Exception as exc:
-        set_status(department, filename, "failed", f"解析失败：{exc}")
+        set_status(user_id, department, filename, "failed", f"解析失败：{exc}")
         return
 
     with _ingest_lock:
         try:
-            index_knowledge_base(department)
+            index_knowledge_base(user_id, department)
         except Exception as exc:
-            set_status(department, filename, "failed", f"索引失败：{exc}")
+            set_status(user_id, department, filename, "failed", f"索引失败：{exc}")
 
 
 _ingest_lock = threading.Lock()

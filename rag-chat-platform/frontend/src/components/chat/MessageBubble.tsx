@@ -38,8 +38,17 @@ export function MessageBubble({ message, streaming = false, debug = false }: Pro
                 }`
           }
         >
+          {isUser && !!message.attachments?.length && (
+            <div className="mb-2 flex flex-wrap gap-1">
+              {message.attachments.map((item) => (
+                <span key={item.name} className="rounded-full bg-white/15 px-2 py-0.5 text-xs">
+                  {item.name}
+                </span>
+              ))}
+            </div>
+          )}
           {isUser ? (
-            <p className="text-sm leading-7 whitespace-pre-wrap">{message.content}</p>
+            message.content ? <p className="text-sm leading-7 whitespace-pre-wrap">{message.content}</p> : null
           ) : message.content ? (
             message.error ? (
               <p className="text-sm leading-7 whitespace-pre-wrap">{message.content}</p>

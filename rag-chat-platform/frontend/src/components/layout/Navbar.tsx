@@ -8,7 +8,6 @@ import { Button } from '../ui/Button';
 const links = [
   { to: '/chat', label: '聊天' },
   { to: '/knowledge', label: '知识库' },
-  { to: '/history', label: '历史记录' },
 ];
 
 export function Navbar() {
@@ -83,16 +82,6 @@ export function Navbar() {
           </button>
           {menuOpen && (
             <div className="absolute right-0 mt-2 w-40 rounded-xl border border-slate-200 bg-white py-1 shadow-lg">
-              <button
-                type="button"
-                className="block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50"
-                onClick={() => {
-                  setMenuOpen(false);
-                  navigate('/history');
-                }}
-              >
-                历史记录
-              </button>
               <button
                 type="button"
                 className="block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50"

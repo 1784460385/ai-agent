@@ -1,7 +1,6 @@
 import hashlib
 import json
 import re
-import shutil
 import threading
 from pathlib import Path
 
@@ -41,13 +40,14 @@ def root() -> Path:
     return path
 
 
-def _collection_id(folder_key: str) -> str:
+def _collection_id(user_id: int, folder_key: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,40}", folder_key):
-        return f"kb_{folder_key.lower()}"
-    return "kb_" + hashlib.sha1(folder_key.encode("utf-8")).hexdigest()[:16]
+        return f"u{user_id}_kb_{folder_key.lower()}"[:63]
+    digest = hashlib.sha1(f"{user_id}:{folder_key}".encode("utf-8")).hexdigest()[:16]
+    return f"u{user_id}_{digest}"[:63]
 
 
-def _meta_from_dir(path: Path) -> dict:
+def _meta_from_dir(path: Path, owner_id: int) -> dict:
     meta_path = path / ".folder.json"
     data: dict = {}
     if meta_path.is_file():
@@ -63,7 +63,7 @@ def _meta_from_dir(path: Path) -> dict:
             "name": legacy.get("name", path.name),
             "description": legacy.get("description", path.name),
             "keywords": legacy.get("keywords", [legacy.get("name", path.name)]),
-            "collection": _collection_id(path.name),
+            "collection": _collection_id(owner_id, path.name),
         }
     name = str(data.get("name") or path.name)
     description = str(data.get("description") or name)
@@ -76,17 +76,18 @@ def _meta_from_dir(path: Path) -> dict:
         "name": name,
         "description": description,
         "keywords": cleaned_keywords or [name],
-        "collection": str(data.get("collection") or _collection_id(path.name)),
+        "user_id": owner_id,
+        "collection": str(data.get("collection") or _collection_id(owner_id, path.name)),
     }
 
 
-def sync_from_disk() -> None:
+def sync_from_disk(owner_id: int) -> None:
     with _lock:
-        sync_catalog(_meta_from_dir)
+        sync_catalog(lambda path: _meta_from_dir(path, owner_id), owner_id)
 
 
-def folder_map() -> dict[str, dict]:
-    return {folder["key"]: folder for folder in list_folders()}
+def folder_map(user_id: int) -> dict[str, dict]:
+    return {folder["key"]: folder for folder in list_folders(user_id)}
 
 
 def validate_folder_name(name: str) -> str:
@@ -98,37 +99,25 @@ def validate_folder_name(name: str) -> str:
     return cleaned
 
 
-def create_folder(name: str) -> dict:
+def create_folder(user_id: int, name: str) -> dict:
     cleaned = validate_folder_name(name)
     with _lock:
-        if get_folder(cleaned) is not None or (root() / cleaned).exists():
+        if get_folder(user_id, cleaned) is not None:
             raise ValueError("同名文件夹已存在")
-        path = root() / cleaned
-        try:
-            path.mkdir(parents=False)
-        except FileExistsError as exc:
-            raise ValueError("同名文件夹已存在") from exc
         meta = {
+            "user_id": user_id,
             "key": cleaned,
             "name": cleaned,
             "description": cleaned,
             "keywords": [cleaned],
-            "collection": _collection_id(cleaned),
+            "collection": _collection_id(user_id, cleaned),
         }
-        try:
-            insert_folder(meta)
-        except Exception:
-            if path.is_dir():
-                path.rmdir()
-            raise
+        insert_folder(meta)
         return meta
 
 
-def delete_folder(folder_key: str) -> None:
+def delete_folder(user_id: int, folder_key: str) -> None:
     with _lock:
-        if get_folder(folder_key) is None:
+        if get_folder(user_id, folder_key) is None:
             raise ValueError("文件夹不存在")
-        path = root() / folder_key
-        if path.is_dir():
-            shutil.rmtree(path)
-        delete_folder_row(folder_key)
+        delete_folder_row(user_id, folder_key)

@@ -1,25 +1,46 @@
-import { useCallback, useRef, useState } from 'react';
-import { streamChat, type RouterInfo, type SourceItem } from '../api/client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  deleteConversation,
+  getConversation,
+  listConversations,
+  streamChat,
+  type ConversationSummary,
+  type RouterInfo,
+  type SourceItem,
+} from '../api/client';
 
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
   sources?: SourceItem[];
   router?: RouterInfo;
+  attachments?: { name: string; kind: 'file' | 'image' }[];
   error?: boolean;
 }
 
 export function useChat(apiKey: string, modelName: string) {
   const [messages, setMessages] = useState<Message[]>([]);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [conversationId, setConversationId] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const generation = useRef(0);
+  const conversationIdRef = useRef<number | null>(null);
+
+  const refreshConversations = useCallback(async () => {
+    const items = await listConversations();
+    setConversations(items);
+  }, []);
+
+  useEffect(() => {
+    refreshConversations().catch(() => undefined);
+  }, [refreshConversations]);
 
   const sendMessage = useCallback(
-    async (text: string) => {
+    async (text: string, files: File[] = []) => {
       const content = text.trim();
-      if (!content || isLoading) return;
+      if ((!content && !files.length) || isLoading) return;
       if (!apiKey) {
         setError('请先在左侧保存 DeepSeek API Key');
         return;
@@ -27,7 +48,18 @@ export function useChat(apiKey: string, modelName: string) {
 
       const ticket = generation.current;
       setError(null);
-      setMessages((prev) => [...prev, { role: 'user', content }, { role: 'assistant', content: '' }]);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'user',
+          content,
+          attachments: files.map((file) => ({
+            name: file.name,
+            kind: /\.(png|jpe?g|gif|webp)$/i.test(file.name) ? 'image' : 'file',
+          })),
+        },
+        { role: 'assistant', content: '' },
+      ]);
       setIsLoading(true);
 
       const controller = new AbortController();
@@ -59,6 +91,12 @@ export function useChat(apiKey: string, modelName: string) {
           controller.signal,
           (event) => {
             if (ticket !== generation.current) return;
+            if (event.type === 'conversation') {
+              conversationIdRef.current = event.id;
+              setConversationId(event.id);
+              void refreshConversations();
+              return;
+            }
             if (event.type === 'router') {
               router = { via: event.via, departments: event.departments };
               updateAssistant({ router, sources });
@@ -84,7 +122,9 @@ export function useChat(apiKey: string, modelName: string) {
                 error: !assistantContent,
               });
             }
-          }
+          },
+          conversationIdRef.current,
+          files
         );
 
         if (ticket !== generation.current) return;
@@ -111,7 +151,7 @@ export function useChat(apiKey: string, modelName: string) {
         }
       }
     },
-    [apiKey, isLoading, modelName]
+    [apiKey, isLoading, modelName, refreshConversations]
   );
 
   const stop = useCallback(() => {
@@ -122,10 +162,48 @@ export function useChat(apiKey: string, modelName: string) {
     generation.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
+    conversationIdRef.current = null;
+    setConversationId(null);
     setIsLoading(false);
     setMessages([]);
     setError(null);
   }, []);
 
-  return { messages, isLoading, error, sendMessage, stop, startNew };
+  const openConversation = useCallback(async (id: number) => {
+    generation.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsLoading(false);
+    setError(null);
+    const detail = await getConversation(id);
+    conversationIdRef.current = detail.id;
+    setConversationId(detail.id);
+    setMessages(detail.messages);
+  }, []);
+
+  const removeConversation = useCallback(
+    async (id: number) => {
+      await deleteConversation(id);
+      if (conversationIdRef.current === id) {
+        conversationIdRef.current = null;
+        setConversationId(null);
+        setMessages([]);
+      }
+      await refreshConversations();
+    },
+    [refreshConversations]
+  );
+
+  return {
+    messages,
+    conversations,
+    conversationId,
+    isLoading,
+    error,
+    sendMessage,
+    stop,
+    startNew,
+    openConversation,
+    removeConversation,
+  };
 }

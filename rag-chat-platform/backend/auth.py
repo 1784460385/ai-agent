@@ -76,20 +76,21 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
-def ensure_admin() -> None:
+def ensure_admin() -> int:
     db = SessionLocal()
     try:
-        if db.query(User).filter(User.username == "admin").first():
-            return
-        db.add(
-            User(
+        user = db.query(User).filter(User.username == "admin").first()
+        if user is None:
+            user = User(
                 username="admin",
                 password_hash=hash_password("Aa123456"),
                 role="admin",
                 is_active=True,
             )
-        )
-        db.commit()
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        return int(user.id)
     finally:
         db.close()
 

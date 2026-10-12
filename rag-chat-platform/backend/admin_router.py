@@ -3,8 +3,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from auth import hash_password, require_admin
-from database import get_db
+from database import get_db, list_folders
 from models_db import User
+from vector_store import delete_collection_by_name
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -92,6 +93,8 @@ def delete_user(user_id: int, admin: User = Depends(require_admin), db: Session 
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
+    for folder in list_folders(user_id):
+        delete_collection_by_name(folder["collection"])
     db.delete(user)
     db.commit()
     return {"status": "ok", "id": user_id}

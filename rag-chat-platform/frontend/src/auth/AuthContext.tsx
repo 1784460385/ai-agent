@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { http, TOKEN_KEY, USER_KEY, clearSession } from '../api/http';
+import { clearApiKey, clearApiKeyIfOwnerChanged } from '../lib/apiKeyStorage';
 
 export interface AuthUser {
   id: number;
@@ -47,6 +48,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => {
         clearSession();
+        clearApiKey();
         setUser(null);
       })
       .finally(() => setReady(true));
@@ -58,11 +60,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ready,
       async login(username: string, password: string) {
         const response = await http.post('/api/auth/login', { username, password });
+        clearApiKeyIfOwnerChanged(response.data.user.id);
         localStorage.setItem(TOKEN_KEY, response.data.access_token);
         localStorage.setItem(USER_KEY, JSON.stringify(response.data.user));
         setUser(response.data.user);
       },
       logout() {
+        clearApiKey();
         clearSession();
         setUser(null);
       },

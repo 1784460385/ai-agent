@@ -57,22 +57,6 @@ export interface DepartmentInfo {
   files: DocumentInfo[];
 }
 
-export interface HistoryItem {
-  id: number;
-  question: string;
-  answer?: string;
-  citations?: { file: string; snippet: string }[];
-  router_departments: string[];
-  created_at: string;
-}
-
-export interface HistoryPageResult {
-  total: number;
-  page: number;
-  size: number;
-  items: HistoryItem[];
-}
-
 export interface AccountUser {
   id: number;
   username: string;
@@ -81,7 +65,24 @@ export interface AccountUser {
   created_at: string;
 }
 
+export interface ConversationSummary {
+  id: number;
+  title: string;
+  updated_at: string;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: Array<{
+    role: 'user' | 'assistant';
+    content: string;
+    sources?: SourceItem[];
+    router?: RouterInfo;
+    attachments?: { name: string; kind: 'file' | 'image' }[];
+  }>;
+}
+
 export type ChatEvent =
+  | { type: 'conversation'; id: number; title: string }
   | { type: 'router'; via: 'rule' | 'llm'; departments: { key: string; name: string }[] }
   | { type: 'sources'; sources: SourceItem[] }
   | { type: 'delta'; content: string }
@@ -155,17 +156,18 @@ export async function fetchStats(): Promise<number> {
   return data.chunks ?? 0;
 }
 
-export async function listHistory(page: number, size: number, keyword: string): Promise<HistoryPageResult> {
-  const { data } = await http.get('/api/history', { params: { page, size, keyword: keyword || undefined } });
+export async function listConversations(keyword = ''): Promise<ConversationSummary[]> {
+  const { data } = await http.get('/api/conversations', { params: { keyword: keyword || undefined } });
+  return data.items ?? [];
+}
+
+export async function getConversation(id: number): Promise<ConversationDetail> {
+  const { data } = await http.get(`/api/conversations/${id}`);
   return data;
 }
 
-export async function deleteHistory(id: number): Promise<void> {
-  await http.delete(`/api/history/${id}`);
-}
-
-export async function clearHistory(): Promise<void> {
-  await http.delete('/api/history');
+export async function deleteConversation(id: number): Promise<void> {
+  await http.delete(`/api/conversations/${id}`);
 }
 
 export async function listUsers(page: number, size = 20): Promise<{ total: number; page: number; size: number; items: AccountUser[] }> {
@@ -198,16 +200,24 @@ export async function streamChat(
   message: string,
   config: ModelConfig,
   signal: AbortSignal,
-  onEvent: (event: ChatEvent) => void
+  onEvent: (event: ChatEvent) => void,
+  conversationId?: number | null,
+  files: File[] = []
 ): Promise<void> {
   const token = localStorage.getItem(TOKEN_KEY);
+  const form = new FormData();
+  form.append('message', message);
+  form.append('api_key', config.api_key);
+  form.append('base_url', config.base_url);
+  form.append('model_name', config.model_name);
+  if (conversationId) form.append('conversation_id', String(conversationId));
+  files.forEach((file) => form.append('files', file));
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ message, config }),
+    body: form,
     signal,
   });
 

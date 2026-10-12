@@ -27,6 +27,20 @@ class User(Base):
     )
 
 
+class Conversation(Base):
+    __tablename__ = "chat_threads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, index=True)
+    histories: Mapped[list[ChatHistory]] = relationship(
+        back_populates="thread",
+        cascade="all, delete-orphan",
+    )
+
+
 class ChatHistory(Base):
     __tablename__ = "chat_history"
 
@@ -37,4 +51,7 @@ class ChatHistory(Base):
     citations: Mapped[str | None] = mapped_column(Text)
     router_departments: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, index=True)
+    conversation_id: Mapped[int | None] = mapped_column(ForeignKey("chat_threads.id", ondelete="CASCADE"), index=True)
+    attachments: Mapped[str | None] = mapped_column(Text)
+    thread: Mapped[Conversation | None] = relationship(back_populates="histories")
     user: Mapped[User] = relationship(back_populates="histories")

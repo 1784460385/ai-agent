@@ -9,7 +9,7 @@ interface Props {
   error: string | null;
   hasApiKey: boolean;
   debug: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string, files?: File[]) => void;
   onStop: () => void;
 }
 

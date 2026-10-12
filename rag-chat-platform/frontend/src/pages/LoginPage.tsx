@@ -36,6 +36,11 @@ export function LoginPage() {
             <p className="text-sm text-slate-400">知识库问答平台</p>
           </div>
         </div>
+        <div className="flex w-full flex-col items-center">
+          <p className="-mr-[0.28em] w-fit text-5xl leading-[1.35] font-light tracking-[0.28em] text-white">灿若繁星</p>
+          <p className="-mr-[0.28em] mt-4 w-fit text-5xl leading-[1.35] font-light tracking-[0.28em] text-slate-300">学海波澜</p>
+          <span className="mt-8 block h-px w-16 bg-gradient-to-r from-transparent via-orange-400 to-transparent" />
+        </div>
         <p className="max-w-md text-lg leading-8 text-slate-300">登录后按文件夹检索资料，再生成带来源的回答。</p>
       </section>
       <section className="flex items-center justify-center bg-slate-50 p-6">

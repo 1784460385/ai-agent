@@ -1,57 +1,98 @@
-import { Menu, Plus, Settings } from 'lucide-react';
-import { useState } from 'react';
+import { Menu, Settings } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { ChatWindow } from '../components/chat/ChatWindow';
+import { ConversationSidebar } from '../components/chat/ConversationSidebar';
 import { MobileDrawer } from '../components/layout/MobileDrawer';
-import { Sidebar } from '../components/layout/Sidebar';
+import { ApiKeyCard } from '../components/settings/ApiKeyCard';
+import { useAuth } from '../auth/AuthContext';
 import { useChat } from '../hooks/useChat';
 import { useMediaQuery } from '../hooks/useMediaQuery';
-
-const KEY_STORAGE = 'deepseek_api_key';
-const MODEL_STORAGE = 'deepseek_model';
+import { readApiKey, saveApiKey } from '../lib/apiKeyStorage';
 
 export function ChatPage() {
-  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem(KEY_STORAGE) || '');
-  const [modelName, setModelName] = useState(() => sessionStorage.getItem(MODEL_STORAGE) || 'deepseek-flash');
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const { user } = useAuth();
+  const stored = readApiKey(user?.id ?? 0);
+  const [apiKey, setApiKey] = useState(stored.apiKey);
+  const [modelName, setModelName] = useState(stored.modelName);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [debug, setDebug] = useState(false);
   const isDesktop = useMediaQuery('(min-width: 1024px)');
+  const [params, setParams] = useSearchParams();
   const chat = useChat(apiKey, modelName);
 
-  const openSettings = () => {
-    if (isDesktop) {
-      document.getElementById('api-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      return;
-    }
-    setDrawerOpen(true);
+  useEffect(() => {
+    if (!user) return;
+    const next = readApiKey(user.id);
+    setApiKey(next.apiKey);
+    setModelName(next.modelName);
+  }, [user]);
+
+  useEffect(() => {
+    const raw = params.get('conversation');
+    const id = Number(raw);
+    if (!raw || !id) return;
+    void chat.openConversation(id).finally(() => setParams({}, { replace: true }));
+  }, [params, chat.openConversation, setParams]);
+
+  const saveKey = (key: string, model: string) => {
+    if (!user) return;
+    saveApiKey(user.id, key, model);
+    setApiKey(key);
+    setModelName(model);
+    setSettingsOpen(false);
   };
 
-  const sidebar = (
-    <Sidebar
-      saved={Boolean(apiKey)}
-      modelName={modelName}
-      onSave={(key, model) => {
-        sessionStorage.setItem(KEY_STORAGE, key);
-        sessionStorage.setItem(MODEL_STORAGE, model);
-        setApiKey(key);
-        setModelName(model);
-        setDrawerOpen(false);
+  const history = (
+    <ConversationSidebar
+      items={chat.conversations}
+      activeId={chat.conversationId}
+      onNew={() => {
+        chat.startNew();
+        setHistoryOpen(false);
+      }}
+      onSelect={(id) => {
+        void chat.openConversation(id);
+        setHistoryOpen(false);
+      }}
+      onDelete={(id) => {
+        if (!window.confirm('删除这则对话？')) return;
+        void chat.removeConversation(id);
       }}
     />
   );
 
   return (
-    <div className="flex h-full overflow-hidden bg-slate-50">
-      <aside className="hidden h-full w-80 shrink-0 lg:block">{sidebar}</aside>
-      <MobileDrawer open={drawerOpen && !isDesktop} onClose={() => setDrawerOpen(false)}>
-        {sidebar}
+    <div className="flex h-full overflow-hidden bg-white">
+      <aside className="hidden h-full w-[280px] shrink-0 flex-col border-r border-slate-200 lg:flex">
+        <div className="min-h-0 flex-1">{history}</div>
+        <div className="border-t border-slate-200 bg-slate-900 p-3">
+          <ApiKeyCard saved={Boolean(apiKey)} modelName={modelName} onSave={saveKey} />
+        </div>
+      </aside>
+      <MobileDrawer open={historyOpen && !isDesktop} onClose={() => setHistoryOpen(false)}>
+        {history}
       </MobileDrawer>
-      <section className="flex min-w-0 flex-1 flex-col">
+      <MobileDrawer open={settingsOpen && !isDesktop} onClose={() => setSettingsOpen(false)}>
+        <div className="h-full overflow-y-auto bg-slate-900 p-4">
+          <ApiKeyCard saved={Boolean(apiKey)} modelName={modelName} onSave={saveKey} />
+        </div>
+      </MobileDrawer>
+      <section className="flex min-w-0 flex-1 flex-col bg-slate-50">
         <div className="flex h-14 items-center justify-between border-b border-slate-200 bg-white/80 px-4">
           <div className="flex items-center gap-2">
-            <button type="button" className="rounded-lg p-2 text-slate-600 hover:bg-slate-100 lg:hidden" aria-label="打开设置" onClick={() => setDrawerOpen(true)}>
+            <button
+              type="button"
+              className="rounded-lg p-2 text-slate-600 hover:bg-slate-100 lg:hidden"
+              aria-label="打开历史对话"
+              onClick={() => setHistoryOpen(true)}
+            >
               <Menu className="h-5 w-5" />
             </button>
-            <h1 className="text-base font-semibold text-slate-900">知识库问答</h1>
+            <h1 className="truncate text-base font-semibold text-slate-900">
+              {chat.conversations.find((item) => item.id === chat.conversationId)?.title || '知识库问答'}
+            </h1>
           </div>
           <div className="flex items-center gap-1">
             <button
@@ -63,10 +104,12 @@ export function ChatPage() {
             >
               调试
             </button>
-            <button type="button" aria-label="新对话" className="rounded-lg p-2 text-slate-500 hover:bg-slate-100" onClick={chat.startNew}>
-              <Plus className="h-4 w-4" />
-            </button>
-            <button type="button" aria-label="设置" className="rounded-lg p-2 text-slate-500 hover:bg-slate-100" onClick={openSettings}>
+            <button
+              type="button"
+              aria-label="设置"
+              className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 lg:hidden"
+              onClick={() => setSettingsOpen(true)}
+            >
               <Settings className="h-4 w-4" />
             </button>
           </div>

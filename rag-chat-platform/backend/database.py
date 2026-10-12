@@ -46,13 +46,15 @@ _ready = False
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS folders (
   id INTEGER PRIMARY KEY,
-  key TEXT NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
   name TEXT NOT NULL,
   description TEXT NOT NULL,
   keywords TEXT NOT NULL DEFAULT '[]',
   collection TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (user_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -117,11 +119,26 @@ def init_db() -> None:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
             if "content" not in columns:
                 conn.execute("ALTER TABLE documents ADD COLUMN content BLOB")
+            folder_columns = {row[1] for row in conn.execute("PRAGMA table_info(folders)")}
+            if "user_id" in folder_columns:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.commit()
         finally:
             conn.close()
         create_orm_tables()
+        conn = sqlite3.connect(path)
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "chat_history" in tables:
+                history_columns = {row[1] for row in conn.execute("PRAGMA table_info(chat_history)")}
+                if "conversation_id" not in history_columns:
+                    conn.execute("ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER")
+                if "attachments" not in history_columns:
+                    conn.execute("ALTER TABLE chat_history ADD COLUMN attachments TEXT")
+            conn.commit()
+        finally:
+            conn.close()
         _ready = True
 
 
@@ -158,15 +175,21 @@ def _folder_dict(row: sqlite3.Row) -> dict:
     }
 
 
-def list_folders() -> list[dict]:
+def list_folders(user_id: int) -> list[dict]:
     with db() as conn:
-        rows = conn.execute("SELECT * FROM folders ORDER BY key").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM folders WHERE user_id = ? ORDER BY key",
+            (user_id,),
+        ).fetchall()
     return [_folder_dict(row) for row in rows]
 
 
-def get_folder(folder_key: str) -> dict | None:
+def get_folder(user_id: int, folder_key: str) -> dict | None:
     with db() as conn:
-        row = conn.execute("SELECT * FROM folders WHERE key = ?", (folder_key,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM folders WHERE user_id = ? AND key = ?",
+            (user_id, folder_key),
+        ).fetchone()
     if row is None:
         return None
     return _folder_dict(row)
@@ -179,10 +202,10 @@ def insert_folder(meta: dict, conn: sqlite3.Connection | None = None) -> None:
         try:
             current.execute(
                 """
-                INSERT INTO folders (key, name, description, keywords, collection)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO folders (user_id, key, name, description, keywords, collection)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (meta["key"], meta["name"], meta["description"], keywords, meta["collection"]),
+                (meta["user_id"], meta["key"], meta["name"], meta["description"], keywords, meta["collection"]),
             )
         except sqlite3.IntegrityError as exc:
             raise ValueError("同名文件夹已存在") from exc
@@ -194,21 +217,22 @@ def insert_folder(meta: dict, conn: sqlite3.Connection | None = None) -> None:
         write(owned)
 
 
-def delete_folder_row(folder_key: str) -> None:
+def delete_folder_row(user_id: int, folder_key: str) -> None:
     with db() as conn:
-        conn.execute("DELETE FROM folders WHERE key = ?", (folder_key,))
+        conn.execute("DELETE FROM folders WHERE user_id = ? AND key = ?", (user_id, folder_key))
 
 
-def document_rows(folder_key: str | None = None) -> list[dict]:
+def document_rows(user_id: int, folder_key: str | None = None) -> list[dict]:
     sql = """
         SELECT d.filename AS name, d.size, f.key AS department, d.parse_status, d.parse_error
         FROM documents d
         JOIN folders f ON f.id = d.folder_id
+        WHERE f.user_id = ?
     """
-    params: tuple = ()
+    params: tuple = (user_id,)
     if folder_key is not None:
-        sql += " WHERE f.key = ?"
-        params = (folder_key,)
+        sql += " AND f.key = ?"
+        params = (user_id, folder_key)
     sql += " ORDER BY f.key, d.filename"
     with db() as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -224,23 +248,32 @@ def document_rows(folder_key: str | None = None) -> list[dict]:
     ]
 
 
-def get_document_status(department: str, filename: str) -> dict | None:
+def get_document_status(user_id: int, department: str, filename: str) -> dict | None:
     with db() as conn:
         row = conn.execute(
             """
             SELECT d.parse_status, d.parse_error
             FROM documents d
             JOIN folders f ON f.id = d.folder_id
-            WHERE f.key = ? AND d.filename = ?
+            WHERE f.user_id = ? AND f.key = ? AND d.filename = ?
             """,
-            (department, filename),
+            (user_id, department, filename),
         ).fetchone()
     if row is None:
         return None
     return {"status": row["parse_status"], "error": row["parse_error"]}
 
 
+def _owned_folder_id(conn: sqlite3.Connection, user_id: int, department: str) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM folders WHERE user_id = ? AND key = ?",
+        (user_id, department),
+    ).fetchone()
+    return None if row is None else int(row["id"])
+
+
 def upsert_document(
+    user_id: int,
     department: str,
     filename: str,
     status: str,
@@ -253,12 +286,12 @@ def upsert_document(
     suffix = Path(filename).suffix.lower()
     storage_path = f"{department}/{filename}"
     with db() as conn:
-        folder = conn.execute("SELECT id FROM folders WHERE key = ?", (department,)).fetchone()
-        if folder is None:
+        folder_id = _owned_folder_id(conn, user_id, department)
+        if folder_id is None:
             return
         existing = conn.execute(
             "SELECT id FROM documents WHERE folder_id = ? AND filename = ?",
-            (folder["id"], filename),
+            (folder_id, filename),
         ).fetchone()
         if existing is None:
             conn.execute(
@@ -267,7 +300,7 @@ def upsert_document(
                   folder_id, filename, size, suffix, storage_path, content_hash, parse_status, parse_error
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (folder["id"], filename, size or 0, suffix, storage_path, content_hash, status, error),
+                (folder_id, filename, size or 0, suffix, storage_path, content_hash, status, error),
             )
             return
         conn.execute(
@@ -287,6 +320,7 @@ def upsert_document(
 
 
 def save_document_bytes(
+    user_id: int,
     department: str,
     filename: str,
     data: bytes,
@@ -298,8 +332,8 @@ def save_document_bytes(
     suffix = Path(filename).suffix.lower()
     storage_path = f"{department}/{filename}"
     with db() as conn:
-        folder = conn.execute("SELECT id FROM folders WHERE key = ?", (department,)).fetchone()
-        if folder is None:
+        folder_id = _owned_folder_id(conn, user_id, department)
+        if folder_id is None:
             raise ValueError("文件夹不存在")
         conn.execute(
             """
@@ -316,50 +350,50 @@ def save_document_bytes(
               parse_error = excluded.parse_error,
               updated_at = datetime('now')
             """,
-            (folder["id"], filename, len(data), suffix, storage_path, data, content_hash, status, error),
+            (folder_id, filename, len(data), suffix, storage_path, data, content_hash, status, error),
         )
 
 
-def read_document_bytes(department: str, filename: str) -> bytes | None:
+def read_document_bytes(user_id: int, department: str, filename: str) -> bytes | None:
     with db() as conn:
         row = conn.execute(
             """
             SELECT d.content
             FROM documents d
             JOIN folders f ON f.id = d.folder_id
-            WHERE f.key = ? AND d.filename = ?
+            WHERE f.user_id = ? AND f.key = ? AND d.filename = ?
             """,
-            (department, filename),
+            (user_id, department, filename),
         ).fetchone()
     if row is None or row["content"] is None:
         return None
     return bytes(row["content"])
 
 
-def document_blobs(folder_key: str) -> list[tuple[str, bytes]]:
+def document_blobs(user_id: int, folder_key: str) -> list[tuple[str, bytes]]:
     with db() as conn:
         rows = conn.execute(
             """
             SELECT d.filename, d.content
             FROM documents d
             JOIN folders f ON f.id = d.folder_id
-            WHERE f.key = ? AND d.content IS NOT NULL
+            WHERE f.user_id = ? AND f.key = ? AND d.content IS NOT NULL
             ORDER BY d.filename
             """,
-            (folder_key,),
+            (user_id, folder_key),
         ).fetchall()
     return [(row["filename"], bytes(row["content"])) for row in rows]
 
 
-def delete_document_row(department: str, filename: str) -> None:
+def delete_document_row(user_id: int, department: str, filename: str) -> None:
     with db() as conn:
         conn.execute(
             """
             DELETE FROM documents
             WHERE filename = ?
-              AND folder_id = (SELECT id FROM folders WHERE key = ?)
+              AND folder_id = (SELECT id FROM folders WHERE user_id = ? AND key = ?)
             """,
-            (filename, department),
+            (filename, user_id, department),
         )
 
 
@@ -374,23 +408,67 @@ def _legacy_status(root: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def sync_catalog(read_meta: Callable[[Path], dict]) -> None:
-    """把磁盘上尚未入库的原文导入 documents.content。已入库的文件以数据库为准。"""
+def isolate_folders(owner_id: int) -> None:
+    """给已有文件夹补上所属用户。旧库里的公共文件夹归到管理员。"""
+    with db() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(folders)")}
+        if "user_id" in columns:
+            conn.execute("UPDATE folders SET user_id = ? WHERE user_id IS NULL", (owner_id,))
+            return
+        conn.execute("DROP TABLE IF EXISTS folders_new")
+        conn.execute(
+            """
+            CREATE TABLE folders_new (
+              id INTEGER PRIMARY KEY,
+              user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              key TEXT NOT NULL,
+              name TEXT NOT NULL,
+              description TEXT NOT NULL,
+              keywords TEXT NOT NULL DEFAULT '[]',
+              collection TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              UNIQUE (user_id, key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO folders_new (id, user_id, key, name, description, keywords, collection, created_at, updated_at)
+            SELECT id, ?, key, name, description, keywords, collection, created_at, updated_at
+            FROM folders
+            """,
+            (owner_id,),
+        )
+        conn.execute("DROP TABLE folders")
+        conn.execute("ALTER TABLE folders_new RENAME TO folders")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)")
+
+
+def sync_catalog(read_meta: Callable[[Path], dict], owner_id: int) -> None:
+    """把磁盘上尚未入库的原文导入指定用户的 documents.content。"""
     root = Path(KNOWLEDGE_BASE_DIR)
     if not root.is_dir():
         return
     legacy = _legacy_status(root)
     with db() as conn:
-        existing = {row["key"] for row in conn.execute("SELECT key FROM folders")}
+        owned = {
+            row["key"]
+            for row in conn.execute("SELECT key FROM folders WHERE user_id = ?", (owner_id,))
+        }
         for path in sorted(root.iterdir(), key=lambda item: item.name):
             if not path.is_dir() or path.name.startswith("."):
                 continue
-            if path.name in existing:
+            if path.name in owned:
                 continue
             insert_folder(read_meta(path), conn)
-            existing.add(path.name)
+            owned.add(path.name)
 
-        folders = conn.execute("SELECT id, key FROM folders").fetchall()
+        folders = conn.execute(
+            "SELECT id, key FROM folders WHERE user_id = ?",
+            (owner_id,),
+        ).fetchall()
         for folder in folders:
             directory = root / folder["key"]
             if not directory.is_dir():
