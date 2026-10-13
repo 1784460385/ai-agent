@@ -1,3 +1,6 @@
+# 有 NVIDIA 显卡的服务器，先装 CUDA 版 torch，否则默认装的是 CPU 版：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# （cu 版本号以 https://pytorch.org/get-started/locally/ 和显卡驱动支持的 CUDA 版本为准）
 fastapi>=0.115.0
 uvicorn>=0.29.0
 langchain>=0.3.0

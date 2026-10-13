@@ -10,18 +10,21 @@ from config import BASE_DIR
 HUB_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
 SKIP_PREFIXES = ("imgs/", "onnx/", ".")
 SKIP_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".ds_store"}
+COMPLETE_MARKER = ".download_complete"
 # 官方 BAAI/bge-m3 的关键文件。本地尺寸一致时不再访问网络。
 REQUIRED_FILES = {
-    "config.json": 687,
-    "modules.json": 349,
-    "config_sentence_transformers.json": 123,
-    "sentence_bert_config.json": 54,
-    "1_Pooling/config.json": 191,
-    "tokenizer_config.json": 444,
-    "special_tokens_map.json": 964,
-    "tokenizer.json": 17098108,
-    "sentencepiece.bpe.model": 5069051,
-    "pytorch_model.bin": 2271145830,
+    "BAAI/bge-m3": {
+        "config.json": 687,
+        "modules.json": 349,
+        "config_sentence_transformers.json": 123,
+        "sentence_bert_config.json": 54,
+        "1_Pooling/config.json": 191,
+        "tokenizer_config.json": 444,
+        "special_tokens_map.json": 964,
+        "tokenizer.json": 17098108,
+        "sentencepiece.bpe.model": 5069051,
+        "pytorch_model.bin": 2271145830,
+    },
 }
 
 
@@ -92,10 +95,15 @@ def _download(url: str, dest: Path) -> None:
     part.replace(dest)
 
 
-def _local_ready(dest: Path) -> bool:
+def _local_ready(dest: Path, model_id: str) -> bool:
     if not dest.is_dir():
         return False
-    for name, size in REQUIRED_FILES.items():
+    if (dest / COMPLETE_MARKER).is_file():
+        return True
+    required = REQUIRED_FILES.get(model_id)
+    if not required:
+        return False
+    for name, size in required.items():
         path = dest / name
         if not path.is_file() or path.stat().st_size != size:
             return False
@@ -111,7 +119,7 @@ def ensure_local_model(model_id: str) -> str:
         return model_id
 
     dest = BASE_DIR / "models" / model_id
-    if _local_ready(dest):
+    if _local_ready(dest, model_id):
         print(f"[model] 使用本地模型 {dest}", flush=True)
         return str(dest)
 
@@ -121,4 +129,5 @@ def ensure_local_model(model_id: str) -> str:
         if target.exists() and target.stat().st_size > 0:
             continue
         _download(f"{_endpoint()}/{model_id}/resolve/main/{name}", target)
+    (dest / COMPLETE_MARKER).write_text("ok", encoding="utf-8")
     return str(dest)

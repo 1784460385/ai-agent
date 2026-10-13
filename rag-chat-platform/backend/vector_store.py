@@ -11,13 +11,27 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 import chromadb
 from chromadb.utils import embedding_functions
 
-from config import CHROMA_PERSIST_DIR, COLLECTION_NAME, EMBEDDING_MODEL
+from config import (
+    CHROMA_PERSIST_DIR,
+    COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    RECALL_K,
+    RERANK_CANDIDATES,
+    RETRIEVAL_TOP_K,
+    SEARCH_ALL_FOLDERS,
+    UNROUTED_FOLDER_WEIGHT,
+)
+from devices import model_device
 from folders import folder_map, list_folders
+from lexical import BM25Index
+from reranker import get_reranker, rerank
 
 _lock = threading.Lock()
 _model_lock = threading.Lock()
 _client: chromadb.PersistentClient | None = None
 _embedding_function = None
+_bm25_cache: dict[str, BM25Index] = {}
+RRF_K = 60
 
 
 def collection_name(user_id: int, folder_key: str) -> str:
@@ -37,7 +51,7 @@ def get_chroma_client() -> chromadb.PersistentClient:
 
 
 def get_embedding_function():
-    """加载 Embedding 模型。首次调用会使用 backend/models 里的本地模型。"""
+    """加载 Embedding 模型。首次调用会使用 backend/models 里的本地模型，有 GPU 时用 GPU 半精度。"""
     global _embedding_function
     if _embedding_function is not None:
         return _embedding_function
@@ -46,10 +60,25 @@ def get_embedding_function():
             from model_download import ensure_local_model
 
             local_model = ensure_local_model(EMBEDDING_MODEL)
-            _embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=local_model
+            device = model_device()
+            function = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=local_model,
+                device=device,
             )
+            if device.startswith("cuda"):
+                function._model.half()
+            print(f"[EMBED] 已加载 {EMBEDDING_MODEL} ({device})", flush=True)
+            _embedding_function = function
     return _embedding_function
+
+
+def warmup_models() -> None:
+    """后台预加载本地模型，避免第一次提问时才加载。"""
+    try:
+        get_embedding_function()
+        get_reranker()
+    except Exception as exc:
+        print(f"[WARN] 模型预加载失败: {exc}", flush=True)
 
 
 def get_collection(user_id: int, dept: str):
@@ -74,6 +103,7 @@ def collection_count(user_id: int) -> int:
 
 
 def delete_collection_by_name(name: str) -> None:
+    _bm25_cache.pop(name, None)
     try:
         get_chroma_client().delete_collection(name)
     except Exception:
@@ -103,9 +133,11 @@ def replace_documents(
     if texts:
         get_embedding_function()
     with _lock:
+        name = collection_name(user_id, dept)
+        _bm25_cache.pop(name, None)
         client = get_chroma_client()
         try:
-            client.delete_collection(collection_name(user_id, dept))
+            client.delete_collection(name)
         except Exception:
             pass
         if texts:
@@ -124,37 +156,106 @@ def delete_legacy_collection() -> None:
         pass
 
 
-def _hits_from_result(user_id: int, dept: str, results: dict) -> list[dict]:
-    documents = (results.get("documents") or [[]])[0] or []
-    metadatas = (results.get("metadatas") or [[]])[0] or []
-    distances = (results.get("distances") or [[]])[0] or []
-    folder = folder_map(user_id).get(dept) or {}
-    dept_name = folder.get("name", dept)
+def _make_hit(dept: str, dept_name: str, chunk_id: str, content: str, meta: dict | None, distance=None) -> dict:
+    meta = meta or {}
+    return {
+        "id": f"{dept}:{chunk_id}",
+        "content": content,
+        "source": meta.get("source") or "未知来源",
+        "department": dept,
+        "department_name": dept_name,
+        "distance": distance,
+    }
+
+
+def _vector_hits(dept: str, dept_name: str, results: dict, query_index: int) -> list[dict]:
+    ids = (results.get("ids") or [])[query_index] or []
+    documents = (results.get("documents") or [])[query_index] or []
+    metadatas = (results.get("metadatas") or [])[query_index] or []
+    distances = (results.get("distances") or [])[query_index] or []
     hits: list[dict] = []
     for index, content in enumerate(documents):
         if not content:
             continue
-        meta = metadatas[index] if index < len(metadatas) and metadatas[index] else {}
-        hits.append(
-            {
-                "content": content,
-                "source": meta.get("source") or "未知来源",
-                "department": dept,
-                "department_name": dept_name,
-                "distance": distances[index] if index < len(distances) else None,
-            }
-        )
+        meta = metadatas[index] if index < len(metadatas) else None
+        distance = distances[index] if index < len(distances) else None
+        hits.append(_make_hit(dept, dept_name, ids[index], content, meta, distance))
     return hits
 
 
-def search_departments(user_id: int, departments: list[str], query_text: str, n_results: int = 3) -> list[dict]:
-    """从指定部门检索，每个部门最多返回 n_results 条。"""
+def _bm25_index(name: str, collection, count: int) -> BM25Index:
+    index = _bm25_cache.get(name)
+    if index is None or len(index) != count:
+        data = collection.get(include=["documents", "metadatas"])
+        documents = [doc or "" for doc in data.get("documents") or []]
+        metadatas = [meta or {} for meta in data.get("metadatas") or [{}] * len(documents)]
+        index = BM25Index(list(data.get("ids") or []), documents, metadatas)
+        _bm25_cache[name] = index
+    return index
+
+
+def _keyword_hits(dept: str, dept_name: str, index: BM25Index, query: str, limit: int) -> list[dict]:
+    return [
+        _make_hit(dept, dept_name, index.ids[position], index.documents[position], index.metadatas[position])
+        for position, _score in index.search(query, limit)
+        if index.documents[position]
+    ]
+
+
+def _fuse(pool: dict[str, dict], hits: list[dict], weight: float, channel: str) -> None:
+    """倒数排名融合：同一片段在多路结果里排得越靠前，得分越高。"""
+    for rank, hit in enumerate(hits):
+        entry = pool.get(hit["id"])
+        if entry is None:
+            entry = {**hit, "fusion_score": 0.0, "channels": set()}
+            pool[hit["id"]] = entry
+        elif entry.get("distance") is None and hit.get("distance") is not None:
+            entry["distance"] = hit["distance"]
+        entry["fusion_score"] += weight / (RRF_K + rank + 1)
+        entry["channels"].add(channel)
+
+
+def _unique_queries(queries: list[str]) -> list[str]:
+    seen: list[str] = []
+    for query in queries:
+        text = " ".join((query or "").split())[:500]
+        if text and text not in seen:
+            seen.append(text)
+    return seen
+
+
+def _log_hits(query: str, hits: list[dict], reranked: bool) -> None:
+    mode = "重排" if reranked else "融合"
+    print(f"[RETRIEVE] query={query[:80]!r} 返回 {len(hits)} 条（{mode}）", flush=True)
+    for hit in hits:
+        score = hit.get("rerank_score", hit.get("fusion_score"))
+        channels = "+".join(sorted(hit.get("channels") or []))
+        print(f"  - {score:.4f} [{channels}] {hit['source']} | {' '.join(hit['content'].split())[:60]}", flush=True)
+
+
+def search_departments(
+    user_id: int,
+    departments: list[str],
+    query_text: str,
+    n_results: int = RETRIEVAL_TOP_K,
+    extra_queries: list[str] | None = None,
+) -> list[dict]:
+    """混合检索：每个文件夹做向量 + 关键词召回，RRF 融合后用重排模型精排，返回最相关的 n_results 条。
+
+    departments 是路由选中的文件夹。SEARCH_ALL_FOLDERS 开启时其余文件夹也会检索，只是融合权重更低。
+    """
+    queries = _unique_queries([query_text, *(extra_queries or [])])
+    if not queries:
+        return []
+    catalog = folder_map(user_id)
+    routed = [dept for dept in departments if dept in catalog]
+    targets = list(catalog) if SEARCH_ALL_FOLDERS else routed
+
+    pool: dict[str, dict] = {}
     with _lock:
         client = get_chroma_client()
         pending: list[tuple[str, int]] = []
-        for dept in departments:
-            if dept not in folder_map(user_id):
-                continue
+        for dept in targets:
             try:
                 count = client.get_collection(collection_name(user_id, dept)).count()
             except Exception:
@@ -164,23 +265,30 @@ def search_departments(user_id: int, departments: list[str], query_text: str, n_
         if not pending:
             return []
 
-        hits: list[dict] = []
+        query_embeddings = get_embedding_function()(queries)
         for dept, count in pending:
+            dept_name = catalog[dept].get("name", dept)
+            weight = 1.0 if not routed or dept in routed else UNROUTED_FOLDER_WEIGHT
+            limit = min(RECALL_K, count)
             collection = get_collection(user_id, dept)
             results = collection.query(
-                query_texts=[query_text],
-                n_results=min(n_results, count),
+                query_embeddings=query_embeddings,
+                n_results=limit,
                 include=["documents", "metadatas", "distances"],
             )
-            hits.extend(_hits_from_result(user_id, dept, results))
-        return hits
+            index = _bm25_index(collection_name(user_id, dept), collection, count)
+            for position, query in enumerate(queries):
+                _fuse(pool, _vector_hits(dept, dept_name, results, position), weight, "vector")
+                _fuse(pool, _keyword_hits(dept, dept_name, index, query, limit), weight, "keyword")
 
-
-def query_documents(user_id: int, dept: str, query_text: str, n_results: int = 3) -> list[str]:
-    """从指定部门检索文本。"""
-    return [hit["content"] for hit in search_departments(user_id, [dept], query_text, n_results)]
-
-
-def query_multiple_departments(user_id: int, departments: list[str], query_text: str, n_results: int = 3) -> list[str]:
-    """从多个部门检索并合并。"""
-    return [hit["content"] for hit in search_departments(user_id, departments, query_text, n_results)]
+    candidates = sorted(pool.values(), key=lambda hit: hit["fusion_score"], reverse=True)[:RERANK_CANDIDATES]
+    try:
+        ranked = rerank(queries[0], candidates, n_results)
+    except Exception as exc:
+        print(f"[WARN] 重排失败，改用融合排序: {exc}", flush=True)
+        ranked = None
+    hits = ranked if ranked is not None else candidates[:n_results]
+    _log_hits(queries[0], hits, ranked is not None)
+    for hit in hits:
+        hit["channels"] = sorted(hit.get("channels") or [])
+    return hits

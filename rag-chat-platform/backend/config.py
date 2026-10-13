@@ -41,9 +41,25 @@ DEPARTMENTS = {
         "keywords": ["产品", "功能", "需求", "版本", "更新", "用户手册", "原型", "设计", "客服"],
     },
 }
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
-RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "3"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "700"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+# 最终拼进 prompt 的片段数
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+# 每个文件夹、每路检索（向量 / 关键词）的召回数
+RECALL_K = int(os.getenv("RECALL_K", "20"))
+# 融合后送进重排模型的候选数
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
+# 重排分数（0~1）低于该值的片段丢弃
+RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.02"))
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+# auto：有 GPU 才启用重排；1 / 0 强制开关
+RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "auto").strip().lower()
+# auto / cuda / cpu
+MODEL_DEVICE = os.getenv("MODEL_DEVICE", "auto").strip().lower()
+# 1：路由只做加权，所有文件夹都参与检索；0：只查路由选中的文件夹
+SEARCH_ALL_FOLDERS = os.getenv("SEARCH_ALL_FOLDERS", "1") == "1"
+# 未被路由选中的文件夹在融合排序中的权重
+UNROUTED_FOLDER_WEIGHT = float(os.getenv("UNROUTED_FOLDER_WEIGHT", "0.6"))
 RECENT_CONTEXT_TURNS = int(os.getenv("RECENT_CONTEXT_TURNS", "2"))
 SUMMARY_TRIGGER_TOKENS = int(os.getenv("SUMMARY_TRIGGER_TOKENS", "800"))
 SUMMARY_TRIGGER_TURNS = int(os.getenv("SUMMARY_TRIGGER_TURNS", "2"))

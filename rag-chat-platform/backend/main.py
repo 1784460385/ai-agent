@@ -9,6 +9,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import asyncio
 import hashlib
 import json
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -57,7 +58,15 @@ from models import (
 from models_db import User
 from parse_status import clear_status, get_status, set_status
 from rag_engine import build_rag_prompt, index_knowledge_base, ingest_saved_file
-from vector_store import collection_count, delete_folder_collection, department_count, search_departments
+from vector_store import (
+    collection_count,
+    delete_folder_collection,
+    department_count,
+    search_departments,
+    warmup_models,
+)
+from devices import device_info
+from reranker import reranker_status
 from router import route_query
 
 @asynccontextmanager
@@ -67,6 +76,7 @@ async def lifespan(_app: FastAPI):
     isolate_folders(admin_id)
     sync_from_disk(admin_id)
     backfill_conversations()
+    threading.Thread(target=warmup_models, name="model-warmup", daemon=True).start()
     yield
 
 
@@ -174,7 +184,11 @@ async def runtime_config(_user: User = Depends(get_current_user)):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        **device_info(),
+        "reranker": reranker_status(),
+    }
 
 
 @app.get("/api/stats", response_model=StatsResponse)
@@ -308,7 +322,12 @@ async def chat_endpoint(
 
     try:
         hits = await asyncio.to_thread(
-            search_departments, user_id, target_departments, retrieval_query, RETRIEVAL_TOP_K
+            search_departments,
+            user_id,
+            target_departments,
+            retrieval_query,
+            RETRIEVAL_TOP_K,
+            [question],
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"知识库检索失败: {_safe_error(exc, api_key)}")

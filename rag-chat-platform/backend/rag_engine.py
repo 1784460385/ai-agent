@@ -43,7 +43,7 @@ def load_and_split_documents(user_id: int, only_department: str | None = None) -
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", "。", "！", "？", " ", ""],
+        separators=["\n# ", "\n## ", "\n### ", "\n\n", "\n", "。", "！", "？", "；", " ", ""],
         length_function=len,
     )
     selected = [only_department] if only_department else [folder["key"] for folder in list_folders(user_id)]
@@ -92,7 +92,8 @@ def index_knowledge_base(user_id: int, only_department: str | None = None):
             if not content:
                 continue
             label = f"{dept_name}/{_source_label(chunk.metadata)}"
-            texts.append(content)
+            title = Path(str(chunk.metadata.get("source") or "")).stem
+            texts.append(f"【{title}】\n{content}" if title else content)
             ids.append(f"{dept}_chunk_{len(ids)}")
             metadatas.append({"source": label, "department": dept, "chunk": len(ids) - 1})
         count = replace_documents(user_id, dept, texts, ids, metadatas)
@@ -152,9 +153,10 @@ def build_rag_prompt(user_question: str, retrieved_docs: list[str]) -> str:
     return f"""你是一个知识库助手。优先根据上下文回答；上下文没有依据时，再用你自己的知识回答。
 
 规则：
-1. 如果上下文里有能直接回答问题的信息，只使用这些信息作答，并标注来源。
-2. 如果上下文为空、与问题无关，或不足以回答问题，不要拒答，不要罗列知识库里有哪些无关资料。请用你自己的知识完整回答，并且回答的第一句必须原样写出：{NO_KB_NOTICE}
-3. 自行生成时不要把上下文说成来源，也不要编造知识库里不存在的出处。
+1. 先逐条检查上下文。只要有片段与问题相关（包括提到了问题中的关键词、名称、编号，或能回答问题的一部分），就必须优先依据这些片段作答，并标注来源。
+2. 上下文只能回答一部分时，先按上下文回答能回答的部分并标注来源，再说明哪些部分知识库没有覆盖，可以用你自己的知识补充，补充部分要明确标为"补充说明"。
+3. 只有当上下文为空，或所有片段都与问题完全无关时，才用你自己的知识完整回答，并且回答的第一句必须原样写出：{NO_KB_NOTICE}
+4. 不要罗列与问题无关的资料；自行生成时不要把上下文说成来源，也不要编造知识库里不存在的出处。
 
 ## 上下文信息
 {context}
