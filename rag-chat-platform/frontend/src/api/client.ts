@@ -108,6 +108,11 @@ export async function createFolder(name: string): Promise<{ key: string; name: s
   return data;
 }
 
+export async function renameFolder(folderKey: string, name: string): Promise<{ key: string; name: string }> {
+  const { data } = await http.patch(`/api/folders/${encodeURIComponent(folderKey)}`, { name });
+  return data;
+}
+
 export async function deleteFolder(folderKey: string): Promise<void> {
   await http.delete(`/api/folders/${encodeURIComponent(folderKey)}`);
 }
@@ -134,6 +139,32 @@ export async function uploadDocument(
 
 export async function deleteDocument(department: string, filename: string): Promise<void> {
   await http.delete(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}`);
+}
+
+export async function moveDocument(department: string, filename: string, target: string): Promise<void> {
+  await http.post(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/move`, { target });
+}
+
+export interface DocumentPreview {
+  filename: string;
+  kind: string;
+  preview: string;
+  size: number;
+}
+
+export async function previewDocument(department: string, filename: string): Promise<DocumentPreview> {
+  const { data } = await http.get(
+    `/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/preview`
+  );
+  return data;
+}
+
+export async function fetchDocumentContent(department: string, filename: string): Promise<Blob> {
+  const { data } = await http.get(
+    `/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/content`,
+    { responseType: 'blob' }
+  );
+  return data;
 }
 
 export async function rebuildIndex(department?: string): Promise<IndexResponse> {

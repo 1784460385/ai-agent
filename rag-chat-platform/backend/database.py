@@ -222,6 +222,18 @@ def delete_folder_row(user_id: int, folder_key: str) -> None:
         conn.execute("DELETE FROM folders WHERE user_id = ? AND key = ?", (user_id, folder_key))
 
 
+def update_folder_meta(user_id: int, folder_key: str, name: str, description: str, keywords: list) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE folders
+            SET name = ?, description = ?, keywords = ?, updated_at = datetime('now')
+            WHERE user_id = ? AND key = ?
+            """,
+            (name, description, json.dumps(keywords, ensure_ascii=False), user_id, folder_key),
+        )
+
+
 def document_rows(user_id: int, folder_key: str | None = None) -> list[dict]:
     sql = """
         SELECT d.filename AS name, d.size, f.key AS department, d.parse_status, d.parse_error

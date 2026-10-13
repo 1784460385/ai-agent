@@ -1,3 +1,4 @@
+import { Menu, PanelLeft } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import {
   createFolder,
@@ -5,31 +6,52 @@ import {
   deleteFolder,
   fetchConfig,
   listDepartments,
+  moveDocument,
   rebuildIndex,
+  renameFolder,
   retryParse,
   uploadDocument,
   type AppConfig,
   type DepartmentInfo,
 } from '../../api/client';
-import { Button } from '../ui/Button';
-import { DepartmentGroup } from './DepartmentGroup';
-import { FileUploader } from './FileUploader';
+import { useMediaQuery } from '../../hooks/useMediaQuery';
+import { MobileDrawer } from '../layout/MobileDrawer';
+import { ConfirmModal } from './ConfirmModal';
+import { FilePreviewDrawer } from './FilePreviewDrawer';
+import { FolderDetail } from './FolderDetail';
+import { FolderSidebar } from './FolderSidebar';
+
+const SELECTED_KEY = 'kb-selected-folder';
 
 export function KnowledgePanel() {
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
+  const isWide = useMediaQuery('(min-width: 1280px)');
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [departments, setDepartments] = useState<DepartmentInfo[]>([]);
-  const [openKey, setOpenKey] = useState('finance');
-  const [target, setTarget] = useState('finance');
+  const [selectedKey, setSelectedKey] = useState(() => sessionStorage.getItem(SELECTED_KEY) || '');
   const [busy, setBusy] = useState<'upload' | 'index' | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [folderName, setFolderName] = useState('');
+  const [dropTarget, setDropTarget] = useState('');
+  const [navOpen, setNavOpen] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [deleteTarget, setDeleteTarget] = useState<{ key: string; name: string } | null>(null);
+  const [confirmValue, setConfirmValue] = useState('');
+  const [previewName, setPreviewName] = useState('');
+
+  const selected = departments.find((item) => item.key === selectedKey);
+  const collapsed = isDesktop && !isWide;
 
   const refresh = useCallback(async () => {
     const data = await listDepartments();
     setDepartments(data);
-    setTarget((current) => (data.some((item) => item.key === current) ? current : data[0]?.key || ''));
+    setSelectedKey((current) => {
+      const next = data.some((item) => item.key === current) ? current : data[0]?.key || '';
+      if (next) sessionStorage.setItem(SELECTED_KEY, next);
+      else sessionStorage.removeItem(SELECTED_KEY);
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -47,13 +69,24 @@ export function KnowledgePanel() {
     return () => window.clearInterval(timer);
   }, [parsing, refresh]);
 
+  useEffect(() => {
+    setSelectedFiles([]);
+  }, [selectedKey]);
+
+  const selectFolder = (key: string) => {
+    setSelectedKey(key);
+    sessionStorage.setItem(SELECTED_KEY, key);
+    setNavOpen(false);
+    setError('');
+  };
+
   const uploadFiles = async (files: File[]) => {
     const fallback = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.md', '.markdown', '.txt', '.html', '.htm', '.csv', '.json', '.ipynb'];
     const allowed = new Set((config?.formats ?? fallback.map((ext) => ({ ext }))).map((item) => item.ext.toLowerCase()));
     const accepted = files.filter((file) => allowed.has(`.${file.name.split('.').pop()?.toLowerCase()}`));
     const rejected = files.filter((file) => !accepted.includes(file));
-    if (!target) {
-      setError('请先新建一个文件夹');
+    if (!selectedKey) {
+      setError('请先在左侧选择或新建文件夹');
       return;
     }
     if (!accepted.length) {
@@ -65,10 +98,9 @@ export function KnowledgePanel() {
     setMessage('');
     try {
       for (const file of accepted) {
-        await uploadDocument(file, target);
+        await uploadDocument(file, selectedKey);
       }
       await refresh();
-      setOpenKey(target);
       setMessage('正在解析并建立索引，列表会自动更新');
     } catch (err) {
       setError(err instanceof Error ? err.message : '上传失败');
@@ -114,98 +146,192 @@ export function KnowledgePanel() {
     try {
       await deleteDocument(department, filename);
       await refresh();
+      setSelectedFiles((current) => current.filter((item) => item !== filename));
       setMessage('文件已删除，请重建对应文件夹索引');
     } catch (err) {
       setError(err instanceof Error ? err.message : '删除失败');
     }
   };
 
-  const addFolder = async () => {
-    const name = folderName.trim();
-    if (!name) {
-      setError('请输入文件夹名称');
-      return;
-    }
+  const addFolder = async (name: string) => {
     setError('');
     try {
       const created = await createFolder(name);
-      setFolderName('');
-      setOpenKey(created.key);
-      setTarget(created.key);
       await refresh();
+      selectFolder(created.key);
       setMessage(`已新建文件夹「${created.name}」，可以把文件导入这里`);
     } catch (err) {
       setError(err instanceof Error ? err.message : '无法新建文件夹');
     }
   };
 
-  const removeFolder = async (folderKey: string, folderLabel: string) => {
-    if (!window.confirm(`删除文件夹「${folderLabel}」及其全部文件？`)) return;
+  const changeFolderName = async (folderKey: string, name: string) => {
     setError('');
     try {
-      await deleteFolder(folderKey);
+      const updated = await renameFolder(folderKey, name);
       await refresh();
-      setMessage(`已删除文件夹「${folderLabel}」`);
+      setMessage(`已重命名为「${updated.name}」`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '无法重命名文件夹');
+    }
+  };
+
+  const confirmRemoveFolder = async () => {
+    if (!deleteTarget) return;
+    setError('');
+    try {
+      await deleteFolder(deleteTarget.key);
+      setDeleteTarget(null);
+      setConfirmValue('');
+      await refresh();
+      setMessage(`已删除文件夹「${deleteTarget.name}」`);
     } catch (err) {
       setError(err instanceof Error ? err.message : '无法删除文件夹');
     }
   };
 
+  const handleFileDrop = async (targetKey: string, payload: string) => {
+    if (!payload.startsWith('kb-file:')) return;
+    const rest = payload.slice('kb-file:'.length);
+    const separator = rest.indexOf(':');
+    const source = rest.slice(0, separator);
+    const filename = rest.slice(separator + 1);
+    if (!source || !filename || source === targetKey) return;
+    setError('');
+    try {
+      await moveDocument(source, filename, targetKey);
+      await refresh();
+      setMessage(`已将「${filename}」移动到目标文件夹，请重建相关文件夹索引`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '移动失败');
+    }
+  };
+
+  const batchDelete = async () => {
+    if (!selected || !selectedFiles.length) return;
+    if (!window.confirm(`删除选中的 ${selectedFiles.length} 个文件？删除后需要重建该文件夹索引。`)) return;
+    setError('');
+    try {
+      for (const filename of selectedFiles) {
+        await deleteDocument(selected.key, filename);
+      }
+      await refresh();
+      setSelectedFiles([]);
+      setMessage('文件已删除，请重建对应文件夹索引');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '删除失败');
+    }
+  };
+
+  const batchRetry = async () => {
+    if (!selected || !selectedFiles.length) return;
+    setError('');
+    try {
+      for (const filename of selectedFiles) {
+        await retryParse(selected.key, filename);
+      }
+      await refresh();
+      setMessage('正在重新解析选中文件');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '重试失败');
+    }
+  };
+
+  const sidebarProps = {
+    departments,
+    selectedKey,
+    busy,
+    dropTarget,
+    onSelect: selectFolder,
+    onCreate: addFolder,
+    onRename: changeFolderName,
+    onDelete: (key: string, name: string) => {
+      setDeleteTarget({ key, name });
+      setConfirmValue('');
+    },
+    onRebuildAll: () => void runIndex(),
+    onFileDrop: (key: string, payload: string) => void handleFileDrop(key, payload),
+    onDropTarget: setDropTarget,
+  };
+
   return (
-    <section className="space-y-3">
-      <h2 className="text-xs font-medium tracking-wider text-slate-400 uppercase">知识库</h2>
-      <div className="flex gap-2">
-        <input
-          value={folderName}
-          placeholder="新建文件夹"
-          aria-label="新建文件夹"
-          onChange={(event) => setFolderName(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              void addFolder();
+    <section className="flex h-full min-h-0 overflow-hidden bg-slate-950 text-slate-100">
+      <aside className={`hidden h-full shrink-0 flex-col border-r border-slate-800 lg:flex ${collapsed ? 'w-16' : 'w-72 xl:w-80'}`}>
+        <FolderSidebar {...sidebarProps} collapsed={collapsed} />
+      </aside>
+      <MobileDrawer open={navOpen && !isDesktop} onClose={() => setNavOpen(false)}>
+        <div className="h-full w-80 max-w-[85vw] border-r border-slate-800">
+          <FolderSidebar {...sidebarProps} collapsed={false} />
+        </div>
+      </MobileDrawer>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex items-center gap-2 border-b border-slate-800 px-4 py-3 lg:hidden">
+          <button
+            type="button"
+            aria-label="打开知识库导航"
+            className="rounded-lg p-2 text-slate-300 hover:bg-slate-800"
+            onClick={() => setNavOpen(true)}
+          >
+            <Menu className="h-5 w-5" />
+          </button>
+          <PanelLeft className="h-4 w-4 text-slate-500" />
+          <span className="truncate text-sm font-semibold text-slate-100">{selected?.name || '知识库'}</span>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <FolderDetail
+            department={selected}
+            config={config}
+            busy={busy}
+            dragging={dragging}
+            selectedFiles={selectedFiles}
+            onDragging={setDragging}
+            onFiles={(files) => void uploadFiles(files)}
+            onIndex={() => void runIndex(selected?.key)}
+            onToggleFile={(filename) =>
+              setSelectedFiles((current) => (current.includes(filename) ? current.filter((item) => item !== filename) : [...current, filename]))
             }
-          }}
-          className="min-w-0 flex-1 rounded-lg border border-slate-600 bg-slate-700 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:ring-2 focus:ring-orange-500"
-        />
-        <Button className="shrink-0" onClick={() => void addFolder()} disabled={busy !== null}>
-          新建
-        </Button>
-      </div>
-      {departments.length === 0 ? (
-        <p className="text-xs leading-5 text-slate-400">还没有文件夹。先新建一个，再把文档导入进去。</p>
-      ) : (
-        <FileUploader
-        departments={departments}
-        config={config}
-        value={target}
-        disabled={busy !== null}
-        dragging={dragging}
-        onChange={setTarget}
-        onFiles={(files) => void uploadFiles(files)}
-        onDragging={setDragging}
-      />
-      )}
-      <div className="space-y-2">
-        {departments.map((department) => (
-          <DepartmentGroup
-            key={department.key}
-            department={department}
-            open={openKey === department.key}
-            busy={busy !== null}
-            onToggle={() => setOpenKey((current) => (current === department.key ? '' : department.key))}
-            onIndex={() => void runIndex(department.key)}
-            onDelete={(filename) => void removeFile(department.key, filename)}
-            onRetry={(filename) => void retryFile(department.key, filename)}
-            onRemoveFolder={() => void removeFolder(department.key, department.name)}
+            onToggleAll={() =>
+              setSelectedFiles((current) => (selected && current.length === selected.files.length ? [] : selected?.files.map((file) => file.name) || []))
+            }
+            onPreview={setPreviewName}
+            onDeleteFile={(filename) => selected && void removeFile(selected.key, filename)}
+            onRetryFile={(filename) => selected && void retryFile(selected.key, filename)}
+            onBatchDelete={() => void batchDelete()}
+            onBatchRetry={() => void batchRetry()}
+            onDragStart={() => undefined}
           />
-        ))}
+          {(message || error) && (
+            <div className="mx-auto w-full max-w-7xl px-6 pb-6">
+              {message && <p className="text-xs leading-5 text-slate-400">{message}</p>}
+              {error && <p className="text-xs leading-5 text-red-300">{error}</p>}
+            </div>
+          )}
+        </div>
       </div>
-      <Button variant="secondary" className="w-full" disabled={busy !== null} onClick={() => void runIndex()}>
-        {busy === 'index' ? '索引中…' : '重建全部索引'}
-      </Button>
-      {message && <p className="text-xs leading-5 text-slate-400">{message}</p>}
-      {error && <p className="text-xs leading-5 text-red-300">{error}</p>}
+
+      <ConfirmModal
+        open={Boolean(deleteTarget)}
+        title={`删除文件夹「${deleteTarget?.name || ''}」`}
+        description="将同时删除该文件夹下的全部文件，此操作不可恢复。"
+        confirmText={deleteTarget?.name}
+        confirmValue={confirmValue}
+        onConfirmValueChange={setConfirmValue}
+        onClose={() => {
+          setDeleteTarget(null);
+          setConfirmValue('');
+        }}
+        onConfirm={() => void confirmRemoveFolder()}
+      />
+
+      {previewName && selected && (
+        <FilePreviewDrawer
+          department={selected.key}
+          filename={previewName}
+          size={selected.files.find((file) => file.name === previewName)?.size ?? 0}
+          onClose={() => setPreviewName('')}
+        />
+      )}
     </section>
   );
 }

@@ -58,6 +58,21 @@ class FolderCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=40)
 
 
+class FolderRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=40)
+
+
+class DocumentMoveRequest(BaseModel):
+    target: str = Field(..., min_length=1)
+
+
+class DocumentPreviewResponse(BaseModel):
+    filename: str
+    kind: str
+    preview: str
+    size: int
+
+
 class StatsResponse(BaseModel):
     chunks: int
 

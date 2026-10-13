@@ -14,7 +14,7 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openai import APIStatusError, AsyncOpenAI, AuthenticationError
 from starlette.requests import Request
 
@@ -35,17 +35,21 @@ from config import (
     format_limit_message,
 )
 from database import document_rows, init_db, isolate_folders, read_document_bytes, save_document_bytes
-from folders import create_folder, delete_folder, get_folder, list_folders, sync_from_disk
+from file_parsers import ParseError, load_bytes
+from folders import create_folder, delete_folder, get_folder, list_folders, rename_folder, sync_from_disk
 from history_router import backfill_conversations, open_conversation, prior_messages, save_chat_history
 from history_router import router as history_router
 from history_router import threads as thread_router
 from models import (
     DepartmentListResponse,
     DocumentListResponse,
+    DocumentMoveRequest,
+    DocumentPreviewResponse,
     IndexResponse,
     StatsResponse,
     UploadResponse,
     FolderCreateRequest,
+    FolderRenameRequest,
 )
 from models_db import User
 from parse_status import clear_status, get_status, set_status
@@ -210,6 +214,18 @@ async def list_departments(current_user: User = Depends(get_current_user)):
 async def create_folder_endpoint(payload: FolderCreateRequest, current_user: User = Depends(get_current_user)):
     try:
         return create_folder(current_user.id, payload.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/folders/{folder_key}")
+async def rename_folder_endpoint(
+    folder_key: str,
+    payload: FolderRenameRequest,
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        return rename_folder(current_user.id, folder_key, payload.name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -474,6 +490,80 @@ async def delete_document(department: str, filename: str, current_user: User = D
     clear_status(current_user.id, department, safe_name)
     _remove_disk_copy(department, safe_name)
     return {"status": "ok", "filename": safe_name, "department": department}
+
+
+@app.get("/api/documents/{department}/{filename}/preview", response_model=DocumentPreviewResponse)
+async def preview_document(department: str, filename: str, current_user: User = Depends(get_current_user)):
+    _require_folder(current_user.id, department)
+    safe_name = _safe_filename(filename)
+    data = read_document_bytes(current_user.id, department, safe_name)
+    if data is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    kind = Path(safe_name).suffix.lower().lstrip(".") or "bin"
+    preview = ""
+    try:
+        docs = await asyncio.to_thread(load_bytes, safe_name, data)
+        preview = " ".join(doc.page_content for doc in docs).strip()[:500]
+    except ParseError:
+        preview = ""
+    return DocumentPreviewResponse(filename=safe_name, kind=kind, preview=preview, size=len(data))
+
+
+@app.get("/api/documents/{department}/{filename}/content")
+async def document_content(department: str, filename: str, current_user: User = Depends(get_current_user)):
+    _require_folder(current_user.id, department)
+    safe_name = _safe_filename(filename)
+    data = read_document_bytes(current_user.id, department, safe_name)
+    if data is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    media_types = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+        ".markdown": "text/markdown; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".json": "application/json",
+        ".csv": "text/csv; charset=utf-8",
+    }
+    media_type = media_types.get(Path(safe_name).suffix.lower(), "application/octet-stream")
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
+
+
+@app.post("/api/documents/{department}/{filename}/move")
+async def move_document(
+    department: str,
+    filename: str,
+    payload: DocumentMoveRequest,
+    current_user: User = Depends(get_current_user),
+):
+    _require_folder(current_user.id, department)
+    _require_folder(current_user.id, payload.target)
+    if payload.target == department:
+        return {"status": "ok", "filename": filename, "department": payload.target}
+    safe_name = _safe_filename(filename)
+    data = read_document_bytes(current_user.id, department, safe_name)
+    if data is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if any(item["name"] == safe_name for item in document_rows(current_user.id, payload.target)):
+        raise HTTPException(status_code=400, detail="目标文件夹已有同名文件")
+    status = get_status(current_user.id, department, safe_name)
+    save_document_bytes(
+        current_user.id,
+        payload.target,
+        safe_name,
+        data,
+        status=(status or {}).get("status") or "indexed",
+        content_hash=None,
+        error=(status or {}).get("error"),
+    )
+    clear_status(current_user.id, department, safe_name)
+    _remove_disk_copy(department, safe_name)
+    return {"status": "ok", "filename": safe_name, "department": payload.target}
 
 
 def _remove_disk_copy(department: str, filename: str) -> None:

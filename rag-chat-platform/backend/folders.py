@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 
 from config import KNOWLEDGE_BASE_DIR
-from database import delete_folder_row, get_folder, insert_folder, list_folders, sync_catalog
+from database import delete_folder_row, get_folder, insert_folder, list_folders, sync_catalog, update_folder_meta
 
 LEGACY_FOLDERS = {
     "finance": {
@@ -121,3 +121,20 @@ def delete_folder(user_id: int, folder_key: str) -> None:
         if get_folder(user_id, folder_key) is None:
             raise ValueError("文件夹不存在")
         delete_folder_row(user_id, folder_key)
+
+
+def rename_folder(user_id: int, folder_key: str, name: str) -> dict:
+    cleaned = validate_folder_name(name)
+    with _lock:
+        folder = get_folder(user_id, folder_key)
+        if folder is None:
+            raise ValueError("文件夹不存在")
+        for item in list_folders(user_id):
+            if item["key"] != folder_key and item["name"] == cleaned:
+                raise ValueError("同名文件夹已存在")
+        keywords = [cleaned, *[item for item in folder.get("keywords", []) if item != folder["name"] and item != cleaned]]
+        update_folder_meta(user_id, folder_key, cleaned, cleaned, keywords or [cleaned])
+        updated = get_folder(user_id, folder_key)
+        if updated is None:
+            raise ValueError("文件夹不存在")
+        return updated
