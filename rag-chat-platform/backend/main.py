@@ -40,6 +40,8 @@ from folders import create_folder, delete_folder, get_folder, list_folders, rena
 from context_memory import prepare_conversation_context
 from history_router import backfill_conversations, open_conversation, save_chat_history
 from history_router import router as history_router
+from keys_router import resolve_api_key
+from keys_router import router as keys_router
 from history_router import threads as thread_router
 from models import (
     DepartmentListResponse,
@@ -87,6 +89,7 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(history_router)
 app.include_router(thread_router)
+app.include_router(keys_router)
 
 
 @app.middleware("http")
@@ -247,16 +250,12 @@ async def delete_folder_endpoint(folder_key: str, current_user: User = Depends(g
 async def chat_endpoint(
     message: str = Form(""),
     conversation_id: int | None = Form(None),
-    api_key: str = Form(...),
-    base_url: str = Form(DEEPSEEK_BASE_URL),
-    model_name: str = Form(DEFAULT_MODEL),
+    api_key_id: int = Form(...),
     files: list[UploadFile] = File(default=[]),
     current_user: User = Depends(get_current_user),
 ):
     """RAG 问答接口：检索 → 增强 → 流式生成。可附带文档或图片。"""
-    api_key = api_key.strip()
-    if not api_key:
-        raise HTTPException(status_code=401, detail="缺少 API Key")
+    api_key, model_name, base_url = resolve_api_key(current_user.id, api_key_id)
     question = message.strip()
     if len(question) > 4000:
         raise HTTPException(status_code=400, detail="问题超过 4000 字")

@@ -25,6 +25,24 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    api_keys: Mapped[list[UserApiKey]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+class UserApiKey(Base):
+    __tablename__ = "user_api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(40), nullable=False)
+    api_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(String(80), nullable=False, default="deepseek-flash")
+    base_url: Mapped[str] = mapped_column(String(200), nullable=False, default="https://api.deepseek.com")
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    user: Mapped[User] = relationship(back_populates="api_keys")
 
 
 class Conversation(Base):

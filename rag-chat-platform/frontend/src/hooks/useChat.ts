@@ -18,7 +18,7 @@ export interface Message {
   error?: boolean;
 }
 
-export function useChat(apiKey: string, modelName: string) {
+export function useChat(apiKeyId: number | null) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationId, setConversationId] = useState<number | null>(null);
@@ -41,8 +41,8 @@ export function useChat(apiKey: string, modelName: string) {
     async (text: string, files: File[] = []) => {
       const content = text.trim();
       if ((!content && !files.length) || isLoading) return;
-      if (!apiKey) {
-        setError('请先在左侧保存 DeepSeek API Key');
+      if (!apiKeyId) {
+        setError('请先前往模型配置添加 API Key');
         return;
       }
 
@@ -83,11 +83,7 @@ export function useChat(apiKey: string, modelName: string) {
       try {
         await streamChat(
           content,
-          {
-            api_key: apiKey,
-            base_url: 'https://api.deepseek.com',
-            model_name: modelName || 'deepseek-flash',
-          },
+          { api_key_id: apiKeyId },
           controller.signal,
           (event) => {
             if (ticket !== generation.current) return;
@@ -151,7 +147,7 @@ export function useChat(apiKey: string, modelName: string) {
         }
       }
     },
-    [apiKey, isLoading, modelName, refreshConversations]
+    [apiKeyId, isLoading, refreshConversations]
   );
 
   const stop = useCallback(() => {

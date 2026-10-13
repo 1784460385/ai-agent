@@ -4,6 +4,7 @@ import { Navbar } from './components/layout/Navbar';
 import { AdminRoute, PrivateRoute } from './components/PrivateRoute';
 import { AdminUsersPage } from './pages/AdminUsersPage';
 import { ChatPage } from './pages/ChatPage';
+import { ApiKeysPage } from './pages/ApiKeysPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { LoginPage } from './pages/LoginPage';
 
@@ -28,6 +29,7 @@ export default function App() {
             <Route path="/" element={<Navigate to="/chat" replace />} />
             <Route path="/chat" element={<ChatPage />} />
             <Route path="/knowledge" element={<KnowledgePage />} />
+            <Route path="/settings/keys" element={<ApiKeysPage />} />
             <Route path="/history" element={<Navigate to="/chat" replace />} />
             <Route element={<AdminRoute />}>
               <Route path="/admin/users" element={<AdminUsersPage />} />

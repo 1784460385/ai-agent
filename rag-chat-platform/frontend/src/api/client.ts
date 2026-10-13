@@ -4,9 +4,17 @@ import { ApiError, http, TOKEN_KEY, clearSession } from './http';
 export { ApiError };
 
 export interface ModelConfig {
-  api_key: string;
+  api_key_id: number;
+}
+
+export interface ApiKeyItem {
+  id: number;
+  name: string;
+  masked_key: string;
+  model: string;
   base_url: string;
-  model_name: string;
+  is_default: boolean;
+  created_at: string;
 }
 
 export interface SourceItem {
@@ -227,6 +235,38 @@ export async function changePassword(oldPassword: string, newPassword: string): 
   await http.post('/api/auth/change-password', { old_password: oldPassword, new_password: newPassword });
 }
 
+export async function listApiKeys(): Promise<ApiKeyItem[]> {
+  const { data } = await http.get('/api/keys');
+  return data.items ?? [];
+}
+
+export async function createApiKey(payload: {
+  name: string;
+  api_key: string;
+  model: string;
+  base_url: string;
+}): Promise<ApiKeyItem> {
+  const { data } = await http.post('/api/keys', payload);
+  return data;
+}
+
+export async function updateApiKey(
+  id: number,
+  payload: { name: string; api_key?: string; model: string; base_url: string }
+): Promise<ApiKeyItem> {
+  const { data } = await http.put(`/api/keys/${id}`, payload);
+  return data;
+}
+
+export async function deleteApiKey(id: number): Promise<void> {
+  await http.delete(`/api/keys/${id}`);
+}
+
+export async function setDefaultApiKey(id: number): Promise<ApiKeyItem> {
+  const { data } = await http.post(`/api/keys/${id}/default`);
+  return data;
+}
+
 export async function streamChat(
   message: string,
   config: ModelConfig,
@@ -238,9 +278,7 @@ export async function streamChat(
   const token = localStorage.getItem(TOKEN_KEY);
   const form = new FormData();
   form.append('message', message);
-  form.append('api_key', config.api_key);
-  form.append('base_url', config.base_url);
-  form.append('model_name', config.model_name);
+  form.append('api_key_id', String(config.api_key_id));
   if (conversationId) form.append('conversation_id', String(conversationId));
   files.forEach((file) => form.append('files', file));
   const response = await fetch('/api/chat', {

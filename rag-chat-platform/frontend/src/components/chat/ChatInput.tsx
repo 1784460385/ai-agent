@@ -71,7 +71,7 @@ export function ChatInput({ disabled, loading, onSend, onStop }: Props) {
           value={draft}
           rows={4}
           maxLength={4000}
-          placeholder={disabled ? '请先在左侧保存 API Key' : '问一个知识库里可能有答案的问题'}
+          placeholder={disabled ? '请先前往模型配置添加 API Key' : '问一个知识库里可能有答案的问题'}
           aria-label="输入问题"
           className="w-full resize-none border-0 bg-transparent p-4 text-base outline-none"
           onChange={(event) => setDraft(event.target.value)}
