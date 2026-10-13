@@ -33,6 +33,9 @@ class Conversation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(80), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    summary_last_history_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary_updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, index=True)
     histories: Mapped[list[ChatHistory]] = relationship(

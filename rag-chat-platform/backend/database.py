@@ -136,6 +136,16 @@ def init_db() -> None:
                     conn.execute("ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER")
                 if "attachments" not in history_columns:
                     conn.execute("ALTER TABLE chat_history ADD COLUMN attachments TEXT")
+            if "chat_threads" in tables:
+                thread_columns = {row[1] for row in conn.execute("PRAGMA table_info(chat_threads)")}
+                if "summary" not in thread_columns:
+                    conn.execute("ALTER TABLE chat_threads ADD COLUMN summary TEXT")
+                if "summary_last_history_id" not in thread_columns:
+                    conn.execute(
+                        "ALTER TABLE chat_threads ADD COLUMN summary_last_history_id INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "summary_updated_at" not in thread_columns:
+                    conn.execute("ALTER TABLE chat_threads ADD COLUMN summary_updated_at TEXT")
             conn.commit()
         finally:
             conn.close()

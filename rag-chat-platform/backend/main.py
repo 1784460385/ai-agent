@@ -37,7 +37,8 @@ from config import (
 from database import document_rows, init_db, isolate_folders, read_document_bytes, save_document_bytes
 from file_parsers import ParseError, load_bytes
 from folders import create_folder, delete_folder, get_folder, list_folders, rename_folder, sync_from_disk
-from history_router import backfill_conversations, open_conversation, prior_messages, save_chat_history
+from context_memory import prepare_conversation_context
+from history_router import backfill_conversations, open_conversation, save_chat_history
 from history_router import router as history_router
 from history_router import threads as thread_router
 from models import (
@@ -280,10 +281,19 @@ async def chat_endpoint(
             open_conversation(user_id, conversation_id, stored_question)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="对话不存在") from exc
-    history = prior_messages(user_id, conversation_id)
+    context = await prepare_conversation_context(
+        user_id,
+        conversation_id,
+        user_text or stored_question,
+        api_key,
+        base_url,
+        model_name,
+    )
+    history = context["messages"]
+    retrieval_query = context["retrieval_query"] or (question or stored_question)
 
     target_departments, via = await route_query(
-        query=question or stored_question,
+        query=retrieval_query,
         api_key=api_key,
         base_url=base_url,
         model=model_name,
@@ -299,7 +309,7 @@ async def chat_endpoint(
 
     try:
         hits = await asyncio.to_thread(
-            search_departments, user_id, target_departments, question or stored_question, RETRIEVAL_TOP_K
+            search_departments, user_id, target_departments, retrieval_query, RETRIEVAL_TOP_K
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"知识库检索失败: {_safe_error(exc, api_key)}")
