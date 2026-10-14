@@ -47,15 +47,17 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
 # 每个文件夹、每路检索（向量 / 关键词）的召回数
 RECALL_K = int(os.getenv("RECALL_K", "20"))
-# 融合后送进重排模型的候选数
-RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
+# 融合后送进重排模型的候选数（CPU 重排时建议不要太大）
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
 # 重排分数（0~1）低于该值的片段丢弃
 RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.02"))
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
-# auto：有 GPU 才启用重排；1 / 0 强制开关
+# auto：启用重排（GPU 或 CPU）；1 / 0 强制开关
 RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "auto").strip().lower()
-# auto / cuda / cpu
+# auto / cuda / cpu —— embedding 设备
 MODEL_DEVICE = os.getenv("MODEL_DEVICE", "auto").strip().lower()
+# auto / cuda / cpu —— 重排设备；auto 时 <6GB 显存默认 CPU，避免和 embedding 抢显存
+RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "auto").strip().lower()
 # 1：路由只做加权，所有文件夹都参与检索；0：只查路由选中的文件夹
 SEARCH_ALL_FOLDERS = os.getenv("SEARCH_ALL_FOLDERS", "1") == "1"
 # 未被路由选中的文件夹在融合排序中的权重

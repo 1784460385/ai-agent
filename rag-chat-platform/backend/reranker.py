@@ -3,17 +3,19 @@ from __future__ import annotations
 import threading
 
 from config import RERANK_MIN_SCORE, RERANKER_ENABLED, RERANKER_MODEL
-from devices import model_device
+from devices import empty_cuda_cache, reranker_device
 
 _load_lock = threading.Lock()
 _predict_lock = threading.Lock()
 _model = None
 _load_failed = False
+_loaded_device: str | None = None
 
 
 def reranker_enabled() -> bool:
+    """auto：只要本机能跑就启用（GPU 或 CPU）；0 关闭。"""
     if RERANKER_ENABLED == "auto":
-        return model_device().startswith("cuda")
+        return True
     return RERANKER_ENABLED in {"1", "true", "yes", "on"}
 
 
@@ -21,31 +23,58 @@ def reranker_status() -> str:
     if not reranker_enabled():
         return "disabled"
     if _model is not None:
-        return "ready"
+        return f"ready:{_loaded_device or '?'}"
     return "failed" if _load_failed else "loading"
 
 
+def _load_on(device: str):
+    import torch
+    from sentence_transformers import CrossEncoder
+
+    from model_download import ensure_local_model
+
+    empty_cuda_cache()
+    kwargs = {}
+    if device.startswith("cuda"):
+        kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
+    model = CrossEncoder(
+        ensure_local_model(RERANKER_MODEL),
+        device=device,
+        max_length=512,
+        **kwargs,
+    )
+    if device.startswith("cuda"):
+        model.half()
+        empty_cuda_cache()
+    return model
+
+
 def get_reranker():
-    """加载交叉编码重排模型。加载失败只记一次日志，之后检索退回融合排序。"""
-    global _model, _load_failed
+    """加载交叉编码重排模型。GPU OOM 时自动改到 CPU，不再永久放弃。"""
+    global _model, _load_failed, _loaded_device
     if _model is not None or _load_failed or not reranker_enabled():
         return _model
     with _load_lock:
-        if _model is None and not _load_failed:
+        if _model is not None or _load_failed:
+            return _model
+        preferred = reranker_device()
+        candidates = [preferred]
+        if preferred.startswith("cuda"):
+            candidates.append("cpu")
+        last_error: Exception | None = None
+        for device in candidates:
             try:
-                from sentence_transformers import CrossEncoder
-
-                from model_download import ensure_local_model
-
-                device = model_device()
-                model = CrossEncoder(ensure_local_model(RERANKER_MODEL), device=device, max_length=512)
-                if device.startswith("cuda"):
-                    model.half()
+                model = _load_on(device)
                 _model = model
+                _loaded_device = device
                 print(f"[RERANK] 已加载 {RERANKER_MODEL} ({device})", flush=True)
+                return _model
             except Exception as exc:
-                _load_failed = True
-                print(f"[WARN] 重排模型加载失败，改用融合排序: {exc}", flush=True)
+                last_error = exc
+                empty_cuda_cache()
+                print(f"[WARN] 重排模型在 {device} 加载失败: {exc}", flush=True)
+        _load_failed = True
+        print(f"[WARN] 重排模型不可用，改用融合排序: {last_error}", flush=True)
     return _model
 
 
@@ -54,10 +83,12 @@ def rerank(query: str, hits: list[dict], top_n: int) -> list[dict] | None:
     model = get_reranker()
     if model is None or not hits:
         return None
+    # CPU 上大批量会很慢；GPU 上也控制显存峰值
+    batch_size = 4 if (_loaded_device or "").startswith("cpu") else 8
     with _predict_lock:
         scores = model.predict(
             [(query, hit["content"]) for hit in hits],
-            batch_size=16,
+            batch_size=batch_size,
             show_progress_bar=False,
         )
     for hit, score in zip(hits, scores):

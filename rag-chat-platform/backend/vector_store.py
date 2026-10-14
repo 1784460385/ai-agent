@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -24,7 +25,7 @@ from config import (
 from devices import model_device
 from folders import folder_map, list_folders
 from lexical import BM25Index
-from reranker import get_reranker, rerank
+from reranker import get_reranker, rerank, reranker_enabled, reranker_status
 
 _lock = threading.Lock()
 _model_lock = threading.Lock()
@@ -57,17 +58,33 @@ def get_embedding_function():
         return _embedding_function
     with _model_lock:
         if _embedding_function is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
+
+            from devices import empty_cuda_cache
             from model_download import ensure_local_model
 
             local_model = ensure_local_model(EMBEDDING_MODEL)
             device = model_device()
+            # Chroma 的 EmbeddingFunction 不允许传入 torch.dtype，先自行以 fp16 加载再注入缓存
+            if device.startswith("cuda"):
+                st = SentenceTransformer(
+                    local_model,
+                    device=device,
+                    model_kwargs={"torch_dtype": torch.float16},
+                )
+                st.half()
+                embedding_functions.SentenceTransformerEmbeddingFunction.models[local_model] = st
+                empty_cuda_cache()
             function = embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name=local_model,
                 device=device,
             )
             if device.startswith("cuda"):
-                function._model.half()
-            print(f"[EMBED] 已加载 {EMBEDDING_MODEL} ({device})", flush=True)
+                used = torch.cuda.memory_allocated(0) / 1024 / 1024
+                print(f"[EMBED] 已加载 {EMBEDDING_MODEL} ({device}, {used:.0f} MiB)", flush=True)
+            else:
+                print(f"[EMBED] 已加载 {EMBEDDING_MODEL} ({device})", flush=True)
             _embedding_function = function
     return _embedding_function
 
@@ -76,7 +93,11 @@ def warmup_models() -> None:
     """后台预加载本地模型，避免第一次提问时才加载。"""
     try:
         get_embedding_function()
+        if not reranker_enabled():
+            print("[RERANK] 已禁用（环境变量 RERANKER_ENABLED=0）。删除该变量后重启即可启用。", flush=True)
+            return
         get_reranker()
+        print(f"[RERANK] 状态: {reranker_status()}", flush=True)
     except Exception as exc:
         print(f"[WARN] 模型预加载失败: {exc}", flush=True)
 
@@ -244,6 +265,7 @@ def search_departments(
 
     departments 是路由选中的文件夹。SEARCH_ALL_FOLDERS 开启时其余文件夹也会检索，只是融合权重更低。
     """
+    started_at = time.perf_counter()
     queries = _unique_queries([query_text, *(extra_queries or [])])
     if not queries:
         return []
@@ -281,6 +303,7 @@ def search_departments(
                 _fuse(pool, _vector_hits(dept, dept_name, results, position), weight, "vector")
                 _fuse(pool, _keyword_hits(dept, dept_name, index, query, limit), weight, "keyword")
 
+    recalled_at = time.perf_counter()
     candidates = sorted(pool.values(), key=lambda hit: hit["fusion_score"], reverse=True)[:RERANK_CANDIDATES]
     try:
         ranked = rerank(queries[0], candidates, n_results)
@@ -288,6 +311,11 @@ def search_departments(
         print(f"[WARN] 重排失败，改用融合排序: {exc}", flush=True)
         ranked = None
     hits = ranked if ranked is not None else candidates[:n_results]
+    print(
+        f"[TIMING] 召回 {recalled_at - started_at:.2f}s（{len(pending)} 个文件夹，{len(candidates)} 个候选）"
+        f" | 重排 {time.perf_counter() - recalled_at:.2f}s",
+        flush=True,
+    )
     _log_hits(queries[0], hits, ranked is not None)
     for hit in hits:
         hit["channels"] = sorted(hit.get("channels") or [])

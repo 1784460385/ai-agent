@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -294,6 +295,7 @@ async def chat_endpoint(
             open_conversation(user_id, conversation_id, stored_question)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="对话不存在") from exc
+    started_at = time.perf_counter()
     context = await prepare_conversation_context(
         user_id,
         conversation_id,
@@ -304,6 +306,7 @@ async def chat_endpoint(
     )
     history = context["messages"]
     retrieval_query = context["retrieval_query"] or (question or stored_question)
+    context_at = time.perf_counter()
 
     target_departments, via = await route_query(
         query=retrieval_query,
@@ -319,6 +322,7 @@ async def chat_endpoint(
             {"key": dept, "name": (get_folder(user_id, dept) or {}).get("name", dept)} for dept in target_departments
         ],
     }
+    route_at = time.perf_counter()
 
     try:
         hits = await asyncio.to_thread(
@@ -331,6 +335,12 @@ async def chat_endpoint(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"知识库检索失败: {_safe_error(exc, api_key)}")
+    search_at = time.perf_counter()
+    print(
+        f"[TIMING] 上下文/改写 {context_at - started_at:.2f}s | 路由({via}) {route_at - context_at:.2f}s"
+        f" | 检索 {search_at - route_at:.2f}s",
+        flush=True,
+    )
 
     labeled_docs = [f"[来源: {hit['source']}]\n{hit['content']}" for hit in hits]
     system_prompt = build_rag_prompt(stored_question, labeled_docs)
@@ -392,6 +402,7 @@ async def chat_endpoint(
         parts: list[str] = []
         error_message: str | None = None
         finished = False
+        first_content_at: float | None = None
         try:
             yield _sse({"type": "conversation", "id": conversation["id"], "title": conversation["title"]})
             yield _sse(router_payload)
@@ -403,10 +414,19 @@ async def chat_endpoint(
                 delta = chunk.choices[0].delta
                 content = getattr(delta, "content", None)
                 if content:
+                    if first_content_at is None:
+                        first_content_at = time.perf_counter()
                     parts.append(content)
                     yield _sse({"type": "delta", "content": content})
             yield _sse({"type": "done"})
             finished = True
+            done_at = time.perf_counter()
+            first_wait = f"{first_content_at - search_at:.2f}s" if first_content_at else "无输出"
+            print(
+                f"[TIMING] 模型首字 {first_wait} | 生成完成 {done_at - search_at:.2f}s"
+                f" | 全程 {done_at - started_at:.2f}s | prompt {len(system_prompt)} 字",
+                flush=True,
+            )
         except AuthenticationError:
             error_message = "API Key 无效或未授权"
             yield _sse({"type": "error", "message": error_message})
