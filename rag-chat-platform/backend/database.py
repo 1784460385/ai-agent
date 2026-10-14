@@ -66,12 +66,34 @@ CREATE TABLE IF NOT EXISTS documents (
   storage_path TEXT NOT NULL,
   content BLOB,
   content_hash TEXT,
+  normalized_md TEXT,
+  normalized_jsonl TEXT,
+  parser_version TEXT,
   parse_status TEXT,
   parse_error TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (folder_id, filename)
 );
+
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+  id INTEGER PRIMARY KEY,
+  chunk_id TEXT NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL,
+  doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  page INTEGER,
+  heading_path TEXT NOT NULL DEFAULT '[]',
+  content TEXT NOT NULL,
+  content_type TEXT NOT NULL DEFAULT 'text',
+  parser_version TEXT NOT NULL DEFAULT 'v1',
+  chunk_index INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_user_folder ON knowledge_chunks(user_id, folder_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc ON knowledge_chunks(doc_id);
 
 CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY,
@@ -106,6 +128,24 @@ CREATE INDEX IF NOT EXISTS idx_sources_message ON message_sources(message_id);
 """
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _ensure_fts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+          chunk_id UNINDEXED,
+          search_text,
+          tokenize='unicode61'
+        )
+        """
+    )
+
+
 def init_db() -> None:
     global _ready
     with _lock:
@@ -116,12 +156,14 @@ def init_db() -> None:
         conn = sqlite3.connect(path)
         try:
             conn.executescript(SCHEMA)
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
-            if "content" not in columns:
-                conn.execute("ALTER TABLE documents ADD COLUMN content BLOB")
+            _ensure_column(conn, "documents", "content", "BLOB")
+            _ensure_column(conn, "documents", "normalized_md", "TEXT")
+            _ensure_column(conn, "documents", "normalized_jsonl", "TEXT")
+            _ensure_column(conn, "documents", "parser_version", "TEXT")
             folder_columns = {row[1] for row in conn.execute("PRAGMA table_info(folders)")}
             if "user_id" in folder_columns:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)")
+            _ensure_fts(conn)
             conn.execute("PRAGMA journal_mode = WAL")
             conn.commit()
         finally:
@@ -146,6 +188,7 @@ def init_db() -> None:
                     )
                 if "summary_updated_at" not in thread_columns:
                     conn.execute("ALTER TABLE chat_threads ADD COLUMN summary_updated_at TEXT")
+            _ensure_fts(conn)
             conn.commit()
         finally:
             conn.close()
@@ -229,6 +272,12 @@ def insert_folder(meta: dict, conn: sqlite3.Connection | None = None) -> None:
 
 def delete_folder_row(user_id: int, folder_key: str) -> None:
     with db() as conn:
+        folder = conn.execute(
+            "SELECT id FROM folders WHERE user_id = ? AND key = ?",
+            (user_id, folder_key),
+        ).fetchone()
+        if folder is not None:
+            _delete_fts_for_folder(conn, int(folder["id"]))
         conn.execute("DELETE FROM folders WHERE user_id = ? AND key = ?", (user_id, folder_key))
 
 
@@ -409,6 +458,17 @@ def document_blobs(user_id: int, folder_key: str) -> list[tuple[str, bytes]]:
 
 def delete_document_row(user_id: int, department: str, filename: str) -> None:
     with db() as conn:
+        row = conn.execute(
+            """
+            SELECT d.id
+            FROM documents d
+            JOIN folders f ON f.id = d.folder_id
+            WHERE f.user_id = ? AND f.key = ? AND d.filename = ?
+            """,
+            (user_id, department, filename),
+        ).fetchone()
+        if row is not None:
+            _delete_fts_for_doc(conn, int(row["id"]))
         conn.execute(
             """
             DELETE FROM documents
@@ -417,6 +477,269 @@ def delete_document_row(user_id: int, department: str, filename: str) -> None:
             """,
             (filename, user_id, department),
         )
+
+
+def get_document_ids(user_id: int, department: str, filename: str) -> dict | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT d.id AS doc_id, f.id AS folder_id, f.key AS folder_key, f.name AS folder_name
+            FROM documents d
+            JOIN folders f ON f.id = d.folder_id
+            WHERE f.user_id = ? AND f.key = ? AND d.filename = ?
+            """,
+            (user_id, department, filename),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "doc_id": int(row["doc_id"]),
+        "folder_id": int(row["folder_id"]),
+        "folder_key": row["folder_key"],
+        "folder_name": row["folder_name"],
+    }
+
+
+def save_normalized_document(
+    user_id: int,
+    department: str,
+    filename: str,
+    *,
+    markdown: str,
+    jsonl: str,
+    parser_version: str,
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE documents
+            SET normalized_md = ?, normalized_jsonl = ?, parser_version = ?, updated_at = datetime('now')
+            WHERE filename = ?
+              AND folder_id = (SELECT id FROM folders WHERE user_id = ? AND key = ?)
+            """,
+            (markdown, jsonl, parser_version, filename, user_id, department),
+        )
+
+
+def read_normalized_markdown(user_id: int, department: str, filename: str) -> str | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT d.normalized_md
+            FROM documents d
+            JOIN folders f ON f.id = d.folder_id
+            WHERE f.user_id = ? AND f.key = ? AND d.filename = ?
+            """,
+            (user_id, department, filename),
+        ).fetchone()
+    if row is None or row["normalized_md"] is None:
+        return None
+    return str(row["normalized_md"])
+
+
+def _delete_fts_for_doc(conn: sqlite3.Connection, doc_id: int) -> None:
+    rows = conn.execute(
+        "SELECT chunk_id FROM knowledge_chunks WHERE doc_id = ?",
+        (doc_id,),
+    ).fetchall()
+    for row in rows:
+        conn.execute("DELETE FROM knowledge_chunks_fts WHERE chunk_id = ?", (row["chunk_id"],))
+
+
+def _delete_fts_for_folder(conn: sqlite3.Connection, folder_id: int) -> None:
+    rows = conn.execute(
+        "SELECT chunk_id FROM knowledge_chunks WHERE folder_id = ?",
+        (folder_id,),
+    ).fetchall()
+    for row in rows:
+        conn.execute("DELETE FROM knowledge_chunks_fts WHERE chunk_id = ?", (row["chunk_id"],))
+
+
+def replace_folder_knowledge_chunks(
+    user_id: int,
+    folder_key: str,
+    units: list,
+) -> int:
+    """重建某文件夹下的知识单元与 FTS5 索引。"""
+    from lexical import tokenize
+
+    with db() as conn:
+        folder = conn.execute(
+            "SELECT id FROM folders WHERE user_id = ? AND key = ?",
+            (user_id, folder_key),
+        ).fetchone()
+        if folder is None:
+            return 0
+        folder_id = int(folder["id"])
+        _delete_fts_for_folder(conn, folder_id)
+        conn.execute("DELETE FROM knowledge_chunks WHERE folder_id = ?", (folder_id,))
+        for unit in units:
+            heading = json.dumps(unit.heading_path, ensure_ascii=False)
+            conn.execute(
+                """
+                INSERT INTO knowledge_chunks (
+                  chunk_id, user_id, doc_id, folder_id, source, page, heading_path,
+                  content, content_type, parser_version, chunk_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    unit.chunk_id,
+                    unit.user_id,
+                    unit.doc_id,
+                    unit.folder_id,
+                    unit.source,
+                    unit.page,
+                    heading,
+                    unit.content,
+                    unit.content_type,
+                    unit.parser_version,
+                    unit.chunk_index,
+                ),
+            )
+            # 预分词写入 FTS，中文按 bigram，避免 unicode61 整句不可检
+            search_text = " ".join(tokenize(unit.content))
+            if unit.source:
+                search_text = f"{search_text} {' '.join(tokenize(unit.source))}".strip()
+            if unit.heading_path:
+                search_text = f"{search_text} {' '.join(tokenize(' '.join(unit.heading_path)))}".strip()
+            conn.execute(
+                "INSERT INTO knowledge_chunks_fts (chunk_id, search_text) VALUES (?, ?)",
+                (unit.chunk_id, search_text or unit.content),
+            )
+        return len(units)
+
+
+def fts_search_chunks(
+    user_id: int,
+    folder_keys: list[str],
+    query: str,
+    limit: int,
+) -> list[dict]:
+    """用 FTS5 MATCH 查知识单元，再关联原文与来源。"""
+    from lexical import tokenize
+
+    terms = list(dict.fromkeys(tokenize(query)))
+    if not terms or not folder_keys:
+        return []
+    # 转义 FTS5 特殊字符后按 OR 检索
+    parts: list[str] = []
+    for term in terms:
+        safe = term.replace('"', " ").strip()
+        if not safe:
+            continue
+        parts.append(f'"{safe}"')
+    if not parts:
+        return []
+    match_expr = " OR ".join(parts)
+    placeholders = ",".join("?" for _ in folder_keys)
+    sql = f"""
+        SELECT
+          c.chunk_id,
+          c.content,
+          c.source,
+          c.page,
+          c.heading_path,
+          c.content_type,
+          c.parser_version,
+          c.chunk_index,
+          f.key AS folder_key,
+          f.name AS folder_name,
+          bm25(knowledge_chunks_fts) AS rank
+        FROM knowledge_chunks_fts
+        JOIN knowledge_chunks c ON c.chunk_id = knowledge_chunks_fts.chunk_id
+        JOIN folders f ON f.id = c.folder_id
+        WHERE c.user_id = ?
+          AND f.key IN ({placeholders})
+          AND knowledge_chunks_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+    """
+    try:
+        with db() as conn:
+            rows = conn.execute(sql, (user_id, *folder_keys, match_expr, limit)).fetchall()
+    except sqlite3.OperationalError as exc:
+        print(f"[WARN] FTS5 查询失败: {exc}")
+        return []
+    results = []
+    for row in rows:
+        try:
+            heading_path = json.loads(row["heading_path"] or "[]")
+        except json.JSONDecodeError:
+            heading_path = []
+        results.append(
+            {
+                "chunk_id": row["chunk_id"],
+                "content": row["content"],
+                "source": row["source"],
+                "page": row["page"],
+                "heading_path": heading_path if isinstance(heading_path, list) else [],
+                "content_type": row["content_type"],
+                "parser_version": row["parser_version"],
+                "chunk_index": row["chunk_index"],
+                "folder_key": row["folder_key"],
+                "folder_name": row["folder_name"],
+                "rank": row["rank"],
+            }
+        )
+    return results
+
+
+def get_knowledge_chunks_by_ids(user_id: int, chunk_ids: list[str]) -> list[dict]:
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" for _ in chunk_ids)
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+              c.chunk_id, c.content, c.source, c.page, c.heading_path,
+              c.content_type, c.chunk_index, f.key AS folder_key, f.name AS folder_name
+            FROM knowledge_chunks c
+            JOIN folders f ON f.id = c.folder_id
+            WHERE c.user_id = ? AND c.chunk_id IN ({placeholders})
+            """,
+            (user_id, *chunk_ids),
+        ).fetchall()
+    by_id = {row["chunk_id"]: row for row in rows}
+    ordered = []
+    for chunk_id in chunk_ids:
+        row = by_id.get(chunk_id)
+        if row is None:
+            continue
+        try:
+            heading_path = json.loads(row["heading_path"] or "[]")
+        except json.JSONDecodeError:
+            heading_path = []
+        ordered.append(
+            {
+                "chunk_id": row["chunk_id"],
+                "content": row["content"],
+                "source": row["source"],
+                "page": row["page"],
+                "heading_path": heading_path if isinstance(heading_path, list) else [],
+                "content_type": row["content_type"],
+                "chunk_index": row["chunk_index"],
+                "folder_key": row["folder_key"],
+                "folder_name": row["folder_name"],
+            }
+        )
+    return ordered
+
+
+def count_knowledge_chunks(user_id: int, folder_key: str | None = None) -> int:
+    sql = """
+        SELECT COUNT(*) AS n
+        FROM knowledge_chunks c
+        JOIN folders f ON f.id = c.folder_id
+        WHERE c.user_id = ?
+    """
+    params: list = [user_id]
+    if folder_key is not None:
+        sql += " AND f.key = ?"
+        params.append(folder_key)
+    with db() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return int(row["n"] if row else 0)
 
 
 def _legacy_status(root: Path) -> dict:

@@ -81,7 +81,29 @@ export function KnowledgePanel() {
   };
 
   const uploadFiles = async (files: File[]) => {
-    const fallback = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.md', '.markdown', '.txt', '.html', '.htm', '.csv', '.json', '.ipynb'];
+    const fallback = [
+      '.pdf',
+      '.docx',
+      '.doc',
+      '.xlsx',
+      '.xls',
+      '.pptx',
+      '.md',
+      '.markdown',
+      '.txt',
+      '.html',
+      '.htm',
+      '.csv',
+      '.json',
+      '.ipynb',
+      '.jpg',
+      '.jpeg',
+      '.png',
+      '.webp',
+      '.bmp',
+      '.tif',
+      '.tiff',
+    ];
     const allowed = new Set((config?.formats ?? fallback.map((ext) => ({ ext }))).map((item) => item.ext.toLowerCase()));
     const accepted = files.filter((file) => allowed.has(`.${file.name.split('.').pop()?.toLowerCase()}`));
     const rejected = files.filter((file) => !accepted.includes(file));

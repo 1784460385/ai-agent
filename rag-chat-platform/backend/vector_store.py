@@ -16,6 +16,8 @@ from config import (
     CHROMA_PERSIST_DIR,
     COLLECTION_NAME,
     EMBEDDING_MODEL,
+    MAX_CONTEXT_CHUNKS,
+    NEIGHBOR_EXPAND,
     RECALL_K,
     RERANK_CANDIDATES,
     RETRIEVAL_TOP_K,
@@ -23,15 +25,14 @@ from config import (
     UNROUTED_FOLDER_WEIGHT,
 )
 from devices import model_device
+from database import fts_search_chunks, get_knowledge_chunks_by_ids
 from folders import folder_map, list_folders
-from lexical import BM25Index
 from reranker import get_reranker, rerank, reranker_enabled, reranker_status
 
 _lock = threading.Lock()
 _model_lock = threading.Lock()
 _client: chromadb.PersistentClient | None = None
 _embedding_function = None
-_bm25_cache: dict[str, BM25Index] = {}
 RRF_K = 60
 
 
@@ -124,7 +125,6 @@ def collection_count(user_id: int) -> int:
 
 
 def delete_collection_by_name(name: str) -> None:
-    _bm25_cache.pop(name, None)
     try:
         get_chroma_client().delete_collection(name)
     except Exception:
@@ -150,12 +150,11 @@ def replace_documents(
     ids: list[str],
     metadatas: list[dict] | None = None,
 ) -> int:
-    """清空该部门后重建索引。"""
+    """清空该部门后重建向量索引。"""
     if texts:
         get_embedding_function()
     with _lock:
         name = collection_name(user_id, dept)
-        _bm25_cache.pop(name, None)
         client = get_chroma_client()
         try:
             client.delete_collection(name)
@@ -204,23 +203,19 @@ def _vector_hits(dept: str, dept_name: str, results: dict, query_index: int) -> 
     return hits
 
 
-def _bm25_index(name: str, collection, count: int) -> BM25Index:
-    index = _bm25_cache.get(name)
-    if index is None or len(index) != count:
-        data = collection.get(include=["documents", "metadatas"])
-        documents = [doc or "" for doc in data.get("documents") or []]
-        metadatas = [meta or {} for meta in data.get("metadatas") or [{}] * len(documents)]
-        index = BM25Index(list(data.get("ids") or []), documents, metadatas)
-        _bm25_cache[name] = index
-    return index
-
-
-def _keyword_hits(dept: str, dept_name: str, index: BM25Index, query: str, limit: int) -> list[dict]:
-    return [
-        _make_hit(dept, dept_name, index.ids[position], index.documents[position], index.metadatas[position])
-        for position, _score in index.search(query, limit)
-        if index.documents[position]
-    ]
+def _keyword_hits(user_id: int, departments: list[str], query: str, limit: int) -> list[dict]:
+    """关键词检索面向知识单元层：SQLite FTS5 MATCH。"""
+    hits: list[dict] = []
+    for row in fts_search_chunks(user_id, departments, query, limit):
+        dept = row["folder_key"]
+        meta = {
+            "source": row["source"],
+            "heading_path": " / ".join(row.get("heading_path") or []),
+            "content_type": row.get("content_type"),
+            "page": row.get("page"),
+        }
+        hits.append(_make_hit(dept, row["folder_name"], row["chunk_id"], row["content"], meta))
+    return hits
 
 
 def _fuse(pool: dict[str, dict], hits: list[dict], weight: float, channel: str) -> None:
@@ -261,7 +256,7 @@ def search_departments(
     n_results: int = RETRIEVAL_TOP_K,
     extra_queries: list[str] | None = None,
 ) -> list[dict]:
-    """混合检索：每个文件夹做向量 + 关键词召回，RRF 融合后用重排模型精排，返回最相关的 n_results 条。
+    """混合检索：向量走 Chroma，关键词走知识单元 FTS5，RRF 融合后重排。
 
     departments 是路由选中的文件夹。SEARCH_ALL_FOLDERS 开启时其余文件夹也会检索，只是融合权重更低。
     """
@@ -272,11 +267,13 @@ def search_departments(
     catalog = folder_map(user_id)
     routed = [dept for dept in departments if dept in catalog]
     targets = list(catalog) if SEARCH_ALL_FOLDERS else routed
+    if not targets:
+        return []
 
     pool: dict[str, dict] = {}
+    pending: list[tuple[str, int]] = []
     with _lock:
         client = get_chroma_client()
-        pending: list[tuple[str, int]] = []
         for dept in targets:
             try:
                 count = client.get_collection(collection_name(user_id, dept)).count()
@@ -284,24 +281,31 @@ def search_departments(
                 continue
             if count:
                 pending.append((dept, count))
-        if not pending:
-            return []
 
-        query_embeddings = get_embedding_function()(queries)
-        for dept, count in pending:
-            dept_name = catalog[dept].get("name", dept)
-            weight = 1.0 if not routed or dept in routed else UNROUTED_FOLDER_WEIGHT
-            limit = min(RECALL_K, count)
-            collection = get_collection(user_id, dept)
-            results = collection.query(
-                query_embeddings=query_embeddings,
-                n_results=limit,
-                include=["documents", "metadatas", "distances"],
-            )
-            index = _bm25_index(collection_name(user_id, dept), collection, count)
-            for position, query in enumerate(queries):
-                _fuse(pool, _vector_hits(dept, dept_name, results, position), weight, "vector")
-                _fuse(pool, _keyword_hits(dept, dept_name, index, query, limit), weight, "keyword")
+        if pending:
+            query_embeddings = get_embedding_function()(queries)
+            for dept, count in pending:
+                dept_name = catalog[dept].get("name", dept)
+                weight = 1.0 if not routed or dept in routed else UNROUTED_FOLDER_WEIGHT
+                limit = min(RECALL_K, count)
+                collection = get_collection(user_id, dept)
+                results = collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=limit,
+                    include=["documents", "metadatas", "distances"],
+                )
+                for position, _query in enumerate(queries):
+                    _fuse(pool, _vector_hits(dept, dept_name, results, position), weight, "vector")
+
+    # 关键词通道直接查规范化知识单元 + FTS5（不依赖 Chroma）
+    for query in queries:
+        keyword_hits = _keyword_hits(user_id, targets, query, RECALL_K * max(1, len(targets)))
+        for hit in keyword_hits:
+            weight = 1.0 if not routed or hit["department"] in routed else UNROUTED_FOLDER_WEIGHT
+            _fuse(pool, [hit], weight, "keyword")
+
+    if not pool:
+        return []
 
     recalled_at = time.perf_counter()
     candidates = sorted(pool.values(), key=lambda hit: hit["fusion_score"], reverse=True)[:RERANK_CANDIDATES]
@@ -311,8 +315,11 @@ def search_departments(
         print(f"[WARN] 重排失败，改用融合排序: {exc}", flush=True)
         ranked = None
     hits = ranked if ranked is not None else candidates[:n_results]
+    if NEIGHBOR_EXPAND > 0 and hits:
+        with _lock:
+            hits = _expand_neighbors(user_id, hits)
     print(
-        f"[TIMING] 召回 {recalled_at - started_at:.2f}s（{len(pending)} 个文件夹，{len(candidates)} 个候选）"
+        f"[TIMING] 召回 {recalled_at - started_at:.2f}s（{len(pending)} 个向量库，{len(candidates)} 个候选）"
         f" | 重排 {time.perf_counter() - recalled_at:.2f}s",
         flush=True,
     )
@@ -320,3 +327,60 @@ def search_departments(
     for hit in hits:
         hit["channels"] = sorted(hit.get("channels") or [])
     return hits
+
+
+def _chunk_prefix_and_index(hit: dict) -> tuple[str | None, int | None]:
+    raw_id = str(hit.get("id") or "").split(":", 1)[-1]
+    marker = "_chunk_"
+    if marker not in raw_id:
+        return None, None
+    prefix, _, index_text = raw_id.rpartition(marker)
+    try:
+        return f"{prefix}{marker}", int(index_text)
+    except ValueError:
+        return None, None
+
+
+def _chunk_index(hit: dict) -> int | None:
+    return _chunk_prefix_and_index(hit)[1]
+
+
+def _expand_neighbors(user_id: int, hits: list[dict]) -> list[dict]:
+    """命中某块时带上前后相邻知识单元，补全被切开的同一章节内容。"""
+    selected: list[dict] = []
+    seen: set[str] = set()
+
+    def add(hit: dict) -> None:
+        hit_id = hit.get("id")
+        if not hit_id or hit_id in seen or len(selected) >= MAX_CONTEXT_CHUNKS:
+            return
+        seen.add(hit_id)
+        selected.append(hit)
+
+    for hit in hits:
+        add(hit)
+        prefix, index = _chunk_prefix_and_index(hit)
+        if prefix is None or index is None:
+            continue
+        want = [f"{prefix}{index + offset}" for offset in range(-NEIGHBOR_EXPAND, NEIGHBOR_EXPAND + 1) if offset]
+        neighbors_rows = get_knowledge_chunks_by_ids(user_id, want)
+        neighbors = [
+            _make_hit(
+                row["folder_key"],
+                row["folder_name"],
+                row["chunk_id"],
+                row["content"],
+                {"source": row["source"], "heading_path": " / ".join(row.get("heading_path") or [])},
+            )
+            for row in neighbors_rows
+        ]
+        neighbors.sort(key=lambda item: _chunk_index(item) or 0)
+        for neighbor in neighbors:
+            neighbor["channels"] = set(hit.get("channels") or []) | {"neighbor"}
+            neighbor["fusion_score"] = hit.get("fusion_score", 0)
+            if "rerank_score" in hit:
+                neighbor["rerank_score"] = hit["rerank_score"]
+            add(neighbor)
+        if len(selected) >= MAX_CONTEXT_CHUNKS:
+            break
+    return selected

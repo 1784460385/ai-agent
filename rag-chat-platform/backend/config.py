@@ -41,14 +41,18 @@ DEPARTMENTS = {
         "keywords": ["产品", "功能", "需求", "版本", "更新", "用户手册", "原型", "设计", "客服"],
     },
 }
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "700"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
-# 最终拼进 prompt 的片段数
-RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+# 最终拼进 prompt 的片段数（含相邻扩展前的精排条数）
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "8"))
+# 命中片段时前后各扩展几块，避免「职责」类列表被切散后只答一部分
+NEIGHBOR_EXPAND = int(os.getenv("NEIGHBOR_EXPAND", "1"))
+# 扩展后拼进 prompt 的上限
+MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "12"))
 # 每个文件夹、每路检索（向量 / 关键词）的召回数
 RECALL_K = int(os.getenv("RECALL_K", "20"))
 # 融合后送进重排模型的候选数（CPU 重排时建议不要太大）
-RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
 # 重排分数（0~1）低于该值的片段丢弃
 RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.02"))
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -70,9 +74,20 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek-flash")
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 OFFICE_MAX_BYTES = int(os.getenv("OFFICE_MAX_BYTES", str(50 * 1024 * 1024)))
+IMAGE_MAX_BYTES = int(os.getenv("IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
 PARSE_TIMEOUT_SECONDS = int(os.getenv("PARSE_TIMEOUT_SECONDS", "60"))
+OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "180"))
+OCR_ENABLED = os.getenv("OCR_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+# 单张图最大像素，超出则等比缩小后再 OCR
+OCR_MAX_IMAGE_PIXELS = int(os.getenv("OCR_MAX_IMAGE_PIXELS", str(12_000_000)))
+# PDF 单页文字少于此字符数时，视为扫描页并整页 OCR
+PDF_OCR_MIN_CHARS = int(os.getenv("PDF_OCR_MIN_CHARS", "40"))
+# 文档内嵌图片 OCR 上限，避免超大 PPT/Word 拖垮摄入
+OCR_EMBEDDED_IMAGE_LIMIT = int(os.getenv("OCR_EMBEDDED_IMAGE_LIMIT", "30"))
 
-# 第一、二优先级格式。图片暂不开放上传。
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+# 第一、二优先级 + 图片 OCR
 SUPPORTED_FORMATS = [
     {"ext": ".pdf", "label": "PDF", "max_bytes": MAX_UPLOAD_BYTES},
     {"ext": ".docx", "label": "Word", "max_bytes": OFFICE_MAX_BYTES},
@@ -88,11 +103,16 @@ SUPPORTED_FORMATS = [
     {"ext": ".csv", "label": "CSV", "max_bytes": MAX_UPLOAD_BYTES},
     {"ext": ".json", "label": "JSON", "max_bytes": MAX_UPLOAD_BYTES},
     {"ext": ".ipynb", "label": "Notebook", "max_bytes": MAX_UPLOAD_BYTES},
+    {"ext": ".jpg", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
+    {"ext": ".jpeg", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
+    {"ext": ".png", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
+    {"ext": ".webp", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
+    {"ext": ".bmp", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
+    {"ext": ".tif", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
+    {"ext": ".tiff", "label": "图片", "max_bytes": IMAGE_MAX_BYTES},
 ]
-COMING_SOON_FORMATS = [
-    {"ext": ".jpg", "label": "JPG"},
-    {"ext": ".jpeg", "label": "JPEG"},
-    {"ext": ".png", "label": "PNG"},
+COMING_SOON_FORMATS: list[dict] = [
+    {"ext": ".gif", "label": "GIF"},
 ]
 ALLOWED_SUFFIXES = {item["ext"] for item in SUPPORTED_FORMATS}
 FORMAT_BY_EXT = {item["ext"]: item for item in SUPPORTED_FORMATS}

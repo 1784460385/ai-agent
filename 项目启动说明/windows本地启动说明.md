@@ -53,7 +53,8 @@ http://localhost:5173
 5. 登录和使用
 打开 http://localhost:5173
 用 admin / Aa123456 登录
-进入「知识库」：新建文件夹、上传 PDF/Word/Excel 等、点「重建全部索引」
+进入「知识库」：新建文件夹、上传 PDF/Word/Excel/图片 等、点「重建全部索引」
+图片与扫描件会自动 OCR（首次较慢）；可用环境变量 OCR_ENABLED=0 关闭
 进入「聊天」：在左侧填入自己的 DeepSeek API Key（sk- 开头）并保存，然后提问
 说明：
 

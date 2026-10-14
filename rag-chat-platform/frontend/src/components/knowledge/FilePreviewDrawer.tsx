@@ -13,9 +13,12 @@ interface Props {
 export function FilePreviewDrawer({ department, filename, size, onClose }: Props) {
   const [text, setText] = useState('');
   const [pdfUrl, setPdfUrl] = useState('');
+  const [imageUrl, setImageUrl] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
-  const isPdf = filename.toLowerCase().endsWith('.pdf');
+  const lower = filename.toLowerCase();
+  const isPdf = lower.endsWith('.pdf');
+  const isImage = /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(lower);
 
   useEffect(() => {
     let revoked = '';
@@ -24,6 +27,7 @@ export function FilePreviewDrawer({ department, filename, size, onClose }: Props
     setError('');
     setText('');
     setPdfUrl('');
+    setImageUrl('');
 
     const load = async () => {
       try {
@@ -33,6 +37,16 @@ export function FilePreviewDrawer({ department, filename, size, onClose }: Props
           const url = URL.createObjectURL(blob);
           revoked = url;
           setPdfUrl(url);
+        } else if (isImage) {
+          const [blob, result] = await Promise.all([
+            fetchDocumentContent(department, filename),
+            previewDocument(department, filename),
+          ]);
+          if (!active) return;
+          const url = URL.createObjectURL(blob);
+          revoked = url;
+          setImageUrl(url);
+          setText(result.preview);
         } else {
           const result = await previewDocument(department, filename);
           if (!active) return;
@@ -50,7 +64,7 @@ export function FilePreviewDrawer({ department, filename, size, onClose }: Props
       active = false;
       if (revoked) URL.revokeObjectURL(revoked);
     };
-  }, [department, filename, isPdf]);
+  }, [department, filename, isPdf, isImage]);
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end">
@@ -82,10 +96,23 @@ export function FilePreviewDrawer({ department, filename, size, onClose }: Props
           {!loading && !error && pdfUrl && (
             <iframe title={`${filename} 预览`} src={pdfUrl} className="h-full min-h-[32rem] w-full rounded-lg bg-white" />
           )}
-          {!loading && !error && !pdfUrl && text && (
+          {!loading && !error && imageUrl && (
+            <div className="space-y-4">
+              <img src={imageUrl} alt={filename} className="max-h-80 w-full rounded-lg object-contain bg-slate-900" />
+              {text ? (
+                <div>
+                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">OCR 识别文本</p>
+                  <pre className="whitespace-pre-wrap text-sm leading-6 text-slate-300">{text}</pre>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">尚未识别到文字，可重试解析。</p>
+              )}
+            </div>
+          )}
+          {!loading && !error && !pdfUrl && !imageUrl && text && (
             <pre className="whitespace-pre-wrap text-sm leading-6 text-slate-300">{text}</pre>
           )}
-          {!loading && !error && !pdfUrl && !text && (
+          {!loading && !error && !pdfUrl && !imageUrl && !text && (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <FileText className="mb-3 h-8 w-8 text-slate-600" />
               <p className="text-sm text-slate-400">无法提取正文预览，可查看文件名称与大小。</p>

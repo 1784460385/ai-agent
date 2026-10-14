@@ -1,4 +1,4 @@
-import { FileJson, FileSpreadsheet, FileText, Presentation, RotateCw, Trash2 } from 'lucide-react';
+import { FileJson, FileSpreadsheet, FileText, Image as ImageIcon, Presentation, RotateCw, Trash2 } from 'lucide-react';
 import { useMemo, useRef, useState } from 'react';
 import type { DocumentInfo } from '../../api/client';
 import { fileKind, formatSize } from './status';
@@ -10,11 +10,17 @@ function fileIcon(name: string) {
   if (ext === 'xls' || ext === 'xlsx' || ext === 'csv') return { Icon: FileSpreadsheet, className: 'text-emerald-400' };
   if (ext === 'ppt' || ext === 'pptx') return { Icon: Presentation, className: 'text-orange-400' };
   if (ext === 'json' || ext === 'ipynb') return { Icon: FileJson, className: 'text-amber-300' };
+  if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff', 'gif'].includes(ext)) {
+    return { Icon: ImageIcon, className: 'text-violet-400' };
+  }
   return { Icon: FileText, className: 'text-slate-400' };
 }
 
 function statusText(file: DocumentInfo) {
-  if (file.parse_status === 'parsing') return '解析中';
+  if (file.parse_status === 'parsing') {
+    const image = ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff'].includes(fileKind(file.name));
+    return image ? 'OCR 解析中' : '解析中';
+  }
   if (file.parse_status === 'indexed') return '索引完成';
   if (file.parse_status === 'failed') return file.parse_error || '解析失败';
   return '未索引';

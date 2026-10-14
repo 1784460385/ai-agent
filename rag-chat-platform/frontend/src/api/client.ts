@@ -55,6 +55,9 @@ export interface AppConfig {
   formats: FormatInfo[];
   coming_soon: string[];
   accept: string;
+  ocr_enabled?: boolean;
+  image_max_mb?: number;
+  ocr_timeout_seconds?: number;
 }
 
 export interface DepartmentInfo {

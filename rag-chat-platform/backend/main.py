@@ -36,7 +36,14 @@ from config import (
     SUPPORTED_FORMATS,
     format_limit_message,
 )
-from database import document_rows, init_db, isolate_folders, read_document_bytes, save_document_bytes
+from database import (
+    document_rows,
+    init_db,
+    isolate_folders,
+    read_document_bytes,
+    read_normalized_markdown,
+    save_document_bytes,
+)
 from file_parsers import ParseError, load_bytes
 from folders import create_folder, delete_folder, get_folder, list_folders, rename_folder, sync_from_disk
 from context_memory import prepare_conversation_context
@@ -158,6 +165,20 @@ def _check_payload(data: bytes, suffix: str) -> None:
         raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
     if suffix in {".docx", ".xlsx", ".pptx"} and not data.startswith(b"PK"):
         raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
+    image_magic = {
+        ".jpg": (b"\xff\xd8\xff",),
+        ".jpeg": (b"\xff\xd8\xff",),
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".webp": (b"RIFF",),
+        ".bmp": (b"BM",),
+        ".tif": (b"II*\x00", b"MM\x00*"),
+        ".tiff": (b"II*\x00", b"MM\x00*"),
+    }
+    if suffix in image_magic:
+        if not any(data.startswith(magic) for magic in image_magic[suffix]):
+            raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
+        if suffix == ".webp" and data[8:12] != b"WEBP":
+            raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
     limit = FORMAT_BY_EXT[suffix]["max_bytes"]
     if len(data) > limit:
         raise HTTPException(status_code=413, detail=format_limit_message(suffix))
@@ -165,9 +186,11 @@ def _check_payload(data: bytes, suffix: str) -> None:
 
 @app.get("/api/config")
 async def runtime_config(_user: User = Depends(get_current_user)):
+    from config import IMAGE_MAX_BYTES, OCR_ENABLED, OCR_TIMEOUT_SECONDS
+
     seen: list[str] = []
     for item in COMING_SOON_FORMATS:
-        if item["label"] not in seen and item["label"] != "JPEG":
+        if item["label"] not in seen:
             seen.append(item["label"])
     return {
         "formats": [
@@ -180,6 +203,9 @@ async def runtime_config(_user: User = Depends(get_current_user)):
         ],
         "coming_soon": seen,
         "accept": ",".join(item["ext"] for item in SUPPORTED_FORMATS),
+        "ocr_enabled": OCR_ENABLED,
+        "image_max_mb": IMAGE_MAX_BYTES // (1024 * 1024),
+        "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
     }
 
 
@@ -548,12 +574,14 @@ async def preview_document(department: str, filename: str, current_user: User = 
     if data is None:
         raise HTTPException(status_code=404, detail="文件不存在")
     kind = Path(safe_name).suffix.lower().lstrip(".") or "bin"
-    preview = ""
-    try:
-        docs = await asyncio.to_thread(load_bytes, safe_name, data)
-        preview = " ".join(doc.page_content for doc in docs).strip()[:500]
-    except ParseError:
-        preview = ""
+    # 优先展示规范化 Markdown，便于核对摄入流水线结果
+    preview = (read_normalized_markdown(current_user.id, department, safe_name) or "").strip()[:500]
+    if not preview:
+        try:
+            docs = await asyncio.to_thread(load_bytes, safe_name, data)
+            preview = " ".join(doc.page_content for doc in docs).strip()[:500]
+        except ParseError:
+            preview = ""
     return DocumentPreviewResponse(filename=safe_name, kind=kind, preview=preview, size=len(data))
 
 
@@ -573,6 +601,13 @@ async def document_content(department: str, filename: str, current_user: User = 
         ".htm": "text/html; charset=utf-8",
         ".json": "application/json",
         ".csv": "text/csv; charset=utf-8",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
     }
     media_type = media_types.get(Path(safe_name).suffix.lower(), "application/octet-stream")
     return Response(
