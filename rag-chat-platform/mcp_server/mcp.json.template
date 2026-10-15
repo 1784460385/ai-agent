@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "rag-knowledge-base": {
+      "command": "D:\\Ai-Agent\\rag-chat-platform\\backend\\.venv\\Scripts\\python.exe",
+      "args": [
+        "D:\\Ai-Agent\\rag-chat-platform\\mcp_server\\rag_kb_mcp_server.py"
+      ],
+      "env": {
+        "KB_BASE_URL": "http://127.0.0.1:8000",
+        "KB_USERNAME": "admin",
+        "KB_PASSWORD": "Aa123456",
+        "KB_TIMEOUT": "180"
+      }
+    }
+  }
+}

@@ -1,40 +1,31 @@
-import os
+from config import apply_env  # noqa: F401  必须在所有 huggingface/chroma 模块之前
 
-# 必须在导入 HuggingFace / Chroma 之前设置，否则 Xet 大文件下载会停在 0 字节。
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+apply_env()  # 一次性触发模块顶部声明的默认值,确保后续 import 安全
 
 import asyncio
 import hashlib
 import json
+import logging
 import threading
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from openai import APIStatusError, AsyncOpenAI, AuthenticationError
+from fastapi.responses import JSONResponse, Response
 from starlette.requests import Request
 
 from admin_router import router as admin_router
-from auth import authenticate_token, ensure_admin, get_current_user
+from auth import ensure_admin, get_current_user
 from auth_router import router as auth_router
-from chat_attachments import AttachmentError, compose_user_text, prepare_attachments, vision_model
+from chat_router import router as chat_router
 from config import (
-    ALLOWED_SUFFIXES,
-    BLOCKED_SUFFIXES,
     COMING_SOON_FORMATS,
-    DEEPSEEK_BASE_URL,
-    DEFAULT_MODEL,
-    FORMAT_BY_EXT,
+    IMAGE_MAX_BYTES,
     KNOWLEDGE_BASE_DIR,
-    RETRIEVAL_TOP_K,
+    OCR_ENABLED,
+    OCR_TIMEOUT_SECONDS,
     SUPPORTED_FORMATS,
-    format_limit_message,
 )
 from database import (
     document_rows,
@@ -44,14 +35,14 @@ from database import (
     read_normalized_markdown,
     save_document_bytes,
 )
+from devices import device_info
 from file_parsers import ParseError, load_bytes
 from folders import create_folder, delete_folder, get_folder, list_folders, rename_folder, sync_from_disk
-from context_memory import prepare_conversation_context
-from history_router import backfill_conversations, open_conversation, save_chat_history
+from history_router import backfill_conversations
 from history_router import router as history_router
-from keys_router import resolve_api_key
-from keys_router import router as keys_router
 from history_router import threads as thread_router
+from keys_router import router as keys_router
+from logging_config import configure_logging, get_logger
 from models import (
     DepartmentListResponse,
     DocumentListResponse,
@@ -65,17 +56,20 @@ from models import (
 )
 from models_db import User
 from parse_status import clear_status, get_status, set_status
-from rag_engine import build_rag_prompt, index_knowledge_base, ingest_saved_file
+from rag_engine import ingest_saved_file, index_knowledge_base
+from rate_limit import install_rate_limiter
+from reranker import reranker_status
+from safe_strings import public_error
+from validators import check_payload, safe_filename
 from vector_store import (
     collection_count,
     delete_folder_collection,
     department_count,
-    search_departments,
     warmup_models,
 )
-from devices import device_info
-from reranker import reranker_status
-from router import route_query
+
+configure_logging()
+log = get_logger("rag.main")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -102,12 +96,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 限速:关键接口(chat/login/upload/index)按用户 token 或 IP 做 token bucket
+install_rate_limiter(app)
+
 
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(history_router)
 app.include_router(thread_router)
 app.include_router(keys_router)
+app.include_router(chat_router)
 
 
 @app.middleware("http")
@@ -117,77 +115,19 @@ async def require_login(request: Request, call_next):
         return await call_next(request)
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
-        return JSONResponse({"detail": "无效的登录凭证"}, status_code=401)
+        return JSONResponse({"detail": public_error("auth_invalid_credentials")}, status_code=401)
     try:
+        from auth import authenticate_token
+
         authenticate_token(header.split(" ", 1)[1].strip())
     except HTTPException as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return JSONResponse({"detail": public_error("auth_invalid_credentials")}, status_code=exc.status_code)
     return await call_next(request)
 
 
-def _sse(payload: dict) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _redact(text: str, secret: str) -> str:
-    if secret and text:
-        return text.replace(secret, "***")
-    return text
-
-
-def _safe_error(exc: Exception, api_key: str) -> str:
-    text = str(exc)
-    if api_key:
-        text = text.replace(api_key, "***")
-    return text[:500]
-
-
-def _safe_filename(filename: str | None) -> str:
-    if not filename:
-        raise HTTPException(status_code=400, detail="缺少文件名")
-    name = Path(filename).name
-    if not name or name in {".", ".."} or name.startswith("."):
-        raise HTTPException(status_code=400, detail="无效文件名")
-    suffix = Path(name).suffix.lower()
-    if suffix in BLOCKED_SUFFIXES:
-        raise HTTPException(status_code=400, detail="不支持的文件格式")
-    if suffix in {item["ext"] for item in COMING_SOON_FORMATS}:
-        raise HTTPException(status_code=400, detail="该格式即将支持")
-    if suffix not in ALLOWED_SUFFIXES:
-        raise HTTPException(status_code=400, detail="不支持的文件格式")
-    return name
-
-
-def _check_payload(data: bytes, suffix: str) -> None:
-    if data.startswith(b"MZ"):
-        raise HTTPException(status_code=400, detail="不支持的文件格式")
-    if suffix == ".pdf" and not data.startswith(b"%PDF"):
-        raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
-    if suffix in {".docx", ".xlsx", ".pptx"} and not data.startswith(b"PK"):
-        raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
-    image_magic = {
-        ".jpg": (b"\xff\xd8\xff",),
-        ".jpeg": (b"\xff\xd8\xff",),
-        ".png": (b"\x89PNG\r\n\x1a\n",),
-        ".webp": (b"RIFF",),
-        ".bmp": (b"BM",),
-        ".tif": (b"II*\x00", b"MM\x00*"),
-        ".tiff": (b"II*\x00", b"MM\x00*"),
-    }
-    if suffix in image_magic:
-        if not any(data.startswith(magic) for magic in image_magic[suffix]):
-            raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
-        if suffix == ".webp" and data[8:12] != b"WEBP":
-            raise HTTPException(status_code=400, detail="文件内容与扩展名不符")
-    limit = FORMAT_BY_EXT[suffix]["max_bytes"]
-    if len(data) > limit:
-        raise HTTPException(status_code=413, detail=format_limit_message(suffix))
-
-
+# ---- 系统 ----
 @app.get("/api/config")
 async def runtime_config(_user: User = Depends(get_current_user)):
-    from config import IMAGE_MAX_BYTES, OCR_ENABLED, OCR_TIMEOUT_SECONDS
-
     seen: list[str] = []
     for item in COMING_SOON_FORMATS:
         if item["label"] not in seen:
@@ -224,6 +164,7 @@ async def stats(current_user: User = Depends(get_current_user)):
     return StatsResponse(chunks=chunks)
 
 
+# ---- 文件夹 ----
 def _department_files(user_id: int, dept: str) -> list[dict]:
     return document_rows(user_id, dept)
 
@@ -287,216 +228,7 @@ async def delete_folder_endpoint(folder_key: str, current_user: User = Depends(g
     return {"status": "ok", "key": folder_key}
 
 
-@app.post("/api/chat")
-async def chat_endpoint(
-    message: str = Form(""),
-    conversation_id: int | None = Form(None),
-    api_key_id: int = Form(...),
-    files: list[UploadFile] = File(default=[]),
-    current_user: User = Depends(get_current_user),
-):
-    """RAG 问答接口：检索 → 增强 → 流式生成。可附带文档或图片。"""
-    api_key, model_name, base_url = resolve_api_key(current_user.id, api_key_id)
-    question = message.strip()
-    if len(question) > 4000:
-        raise HTTPException(status_code=400, detail="问题超过 4000 字")
-    payloads: list[tuple[str, bytes]] = []
-    for upload in files or []:
-        if not upload.filename:
-            continue
-        payloads.append((upload.filename, await upload.read()))
-    if not question and not payloads:
-        raise HTTPException(status_code=400, detail="请输入问题或添加附件")
-    try:
-        prepared = await asyncio.to_thread(prepare_attachments, payloads)
-    except AttachmentError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if prepared["images"] and not vision_model(model_name):
-        raise HTTPException(status_code=400, detail="当前模型不能识别图片，请改为 deepseek-flash")
-    user_text = compose_user_text(question, prepared["document_text"])
-    stored_question = question or "请根据附件回答"
-    user_id = current_user.id
-    if conversation_id is not None:
-        try:
-            open_conversation(user_id, conversation_id, stored_question)
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail="对话不存在") from exc
-    started_at = time.perf_counter()
-    context = await prepare_conversation_context(
-        user_id,
-        conversation_id,
-        user_text or stored_question,
-        api_key,
-        base_url,
-        model_name,
-    )
-    history = context["messages"]
-    retrieval_query = context["retrieval_query"] or (question or stored_question)
-    context_at = time.perf_counter()
-
-    target_departments, via = await route_query(
-        query=retrieval_query,
-        api_key=api_key,
-        base_url=base_url,
-        model=model_name,
-        user_id=user_id,
-    )
-    router_payload = {
-        "type": "router",
-        "via": via,
-        "departments": [
-            {"key": dept, "name": (get_folder(user_id, dept) or {}).get("name", dept)} for dept in target_departments
-        ],
-    }
-    route_at = time.perf_counter()
-
-    try:
-        hits = await asyncio.to_thread(
-            search_departments,
-            user_id,
-            target_departments,
-            retrieval_query,
-            RETRIEVAL_TOP_K,
-            [question],
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"知识库检索失败: {_safe_error(exc, api_key)}")
-    search_at = time.perf_counter()
-    print(
-        f"[TIMING] 上下文/改写 {context_at - started_at:.2f}s | 路由({via}) {route_at - context_at:.2f}s"
-        f" | 检索 {search_at - route_at:.2f}s",
-        flush=True,
-    )
-
-    labeled_docs = [f"[来源: {hit['source']}]\n{hit['content']}" for hit in hits]
-    system_prompt = build_rag_prompt(stored_question, labeled_docs)
-    sources = [
-        {
-            "index": index,
-            "source": hit["source"],
-            "department": hit["department"],
-            "department_name": hit["department_name"],
-            "preview": " ".join(hit["content"].split())[:80],
-            "excerpt": hit["content"],
-        }
-        for index, hit in enumerate(hits, start=1)
-    ]
-    user_content: str | list = user_text
-    if prepared["images"]:
-        user_content = [{"type": "text", "text": user_text}]
-        user_content.extend(
-            {"type": "image_url", "image_url": {"url": image["data_url"], "detail": "high"}}
-            for image in prepared["images"]
-        )
-
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=base_url or DEEPSEEK_BASE_URL,
-        max_retries=0,
-        timeout=90,
-    )
-
-    try:
-        stream = await client.chat.completions.create(
-            model=model_name or DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                *history,
-                {"role": "user", "content": user_content},
-            ],
-            stream=True,
-            temperature=0.3,
-        )
-    except AuthenticationError:
-        raise HTTPException(status_code=401, detail="API Key 无效或未授权")
-    except APIStatusError as exc:
-        if exc.status_code == 401:
-            raise HTTPException(status_code=401, detail="API Key 无效或未授权")
-        raise HTTPException(
-            status_code=502,
-            detail=f"模型服务返回错误 ({exc.status_code})",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"模型服务不可用: {_safe_error(exc, api_key)}")
-
-    try:
-        conversation = open_conversation(user_id, conversation_id, _redact(stored_question, api_key))
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail="对话不存在") from exc
-
-    async def event_stream():
-        parts: list[str] = []
-        error_message: str | None = None
-        finished = False
-        first_content_at: float | None = None
-        try:
-            yield _sse({"type": "conversation", "id": conversation["id"], "title": conversation["title"]})
-            yield _sse(router_payload)
-            if sources:
-                yield _sse({"type": "sources", "sources": sources})
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", None)
-                if content:
-                    if first_content_at is None:
-                        first_content_at = time.perf_counter()
-                    parts.append(content)
-                    yield _sse({"type": "delta", "content": content})
-            yield _sse({"type": "done"})
-            finished = True
-            done_at = time.perf_counter()
-            first_wait = f"{first_content_at - search_at:.2f}s" if first_content_at else "无输出"
-            print(
-                f"[TIMING] 模型首字 {first_wait} | 生成完成 {done_at - search_at:.2f}s"
-                f" | 全程 {done_at - started_at:.2f}s | prompt {len(system_prompt)} 字",
-                flush=True,
-            )
-        except AuthenticationError:
-            error_message = "API Key 无效或未授权"
-            yield _sse({"type": "error", "message": error_message})
-        except Exception as exc:
-            error_message = _safe_error(exc, api_key)
-            yield _sse({"type": "error", "message": error_message})
-        finally:
-            content = "".join(parts)
-            if error_message:
-                content = f"{content}\n\n{error_message}" if content else error_message
-            elif not content:
-                content = "没有收到模型输出" if finished else "已停止生成"
-            citations = [
-                {
-                    "file": str(hit.get("source") or "未知来源"),
-                    "snippet": str(hit.get("content") or "")[:800],
-                }
-                for hit in hits
-                if hit.get("content")
-            ]
-            try:
-                save_chat_history(
-                    user_id,
-                    _redact(stored_question, api_key),
-                    _redact(content, api_key),
-                    citations,
-                    [item["name"] for item in router_payload["departments"]],
-                    conversation["id"],
-                    prepared["records"],
-                )
-            except Exception:
-                pass
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
+# ---- 文档 ----
 @app.post("/api/index", response_model=IndexResponse)
 async def index_endpoint(department: str | None = Query(default=None), current_user: User = Depends(get_current_user)):
     """触发知识库重新索引。可只重建一个部门。"""
@@ -505,7 +237,9 @@ async def index_endpoint(department: str | None = Query(default=None), current_u
     try:
         result = await asyncio.to_thread(index_knowledge_base, current_user.id, department)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"索引失败: {exc}")
+        # 安全:对外只给固定文案,详细堆栈进日志
+        log.exception("索引失败 user=%s department=%s", current_user.id, department)
+        raise HTTPException(status_code=500, detail=public_error("internal_error")) from exc
     return IndexResponse(**result)
 
 
@@ -516,13 +250,13 @@ async def upload_document(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
 ):
-    """上传文档到当前用户的文件夹，并在后台解析、索引。"""
+    """上传文档到当前用户的文件夹,并在后台解析、索引。"""
     _require_folder(current_user.id, department)
-    filename = _safe_filename(file.filename)
+    filename = safe_filename(file.filename)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="文件为空")
-    _check_payload(data, Path(filename).suffix.lower())
+    check_payload(data, Path(filename).suffix.lower())
 
     save_document_bytes(
         current_user.id,
@@ -546,7 +280,7 @@ async def retry_document(
 ):
     """重新解析并索引一个失败的文件。"""
     _require_folder(current_user.id, department)
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     if read_document_bytes(current_user.id, department, safe_name) is None:
         raise HTTPException(status_code=404, detail="文件不存在")
     set_status(current_user.id, department, safe_name, "parsing")
@@ -558,7 +292,7 @@ async def retry_document(
 async def delete_document(department: str, filename: str, current_user: User = Depends(get_current_user)):
     """删除当前用户某个文件夹下的文档。删除后需要重建该文件夹索引。"""
     _require_folder(current_user.id, department)
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     if get_status(current_user.id, department, safe_name) is None:
         raise HTTPException(status_code=404, detail="文件不存在")
     clear_status(current_user.id, department, safe_name)
@@ -569,12 +303,11 @@ async def delete_document(department: str, filename: str, current_user: User = D
 @app.get("/api/documents/{department}/{filename}/preview", response_model=DocumentPreviewResponse)
 async def preview_document(department: str, filename: str, current_user: User = Depends(get_current_user)):
     _require_folder(current_user.id, department)
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     data = read_document_bytes(current_user.id, department, safe_name)
     if data is None:
         raise HTTPException(status_code=404, detail="文件不存在")
     kind = Path(safe_name).suffix.lower().lstrip(".") or "bin"
-    # 优先展示规范化 Markdown，便于核对摄入流水线结果
     preview = (read_normalized_markdown(current_user.id, department, safe_name) or "").strip()[:500]
     if not preview:
         try:
@@ -588,7 +321,7 @@ async def preview_document(department: str, filename: str, current_user: User = 
 @app.get("/api/documents/{department}/{filename}/content")
 async def document_content(department: str, filename: str, current_user: User = Depends(get_current_user)):
     _require_folder(current_user.id, department)
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     data = read_document_bytes(current_user.id, department, safe_name)
     if data is None:
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -628,7 +361,7 @@ async def move_document(
     _require_folder(current_user.id, payload.target)
     if payload.target == department:
         return {"status": "ok", "filename": filename, "department": payload.target}
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     data = read_document_bytes(current_user.id, department, safe_name)
     if data is None:
         raise HTTPException(status_code=404, detail="文件不存在")

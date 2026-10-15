@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+from config import apply_env
+
+apply_env()  # HF / Chroma 默认值已在 config 中集中声明
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -16,6 +16,7 @@ from config import (
     CHROMA_PERSIST_DIR,
     COLLECTION_NAME,
     EMBEDDING_MODEL,
+    MAX_CONTEXT_CHARS,
     MAX_CONTEXT_CHUNKS,
     NEIGHBOR_EXPAND,
     RECALL_K,
@@ -28,12 +29,34 @@ from devices import model_device
 from database import fts_search_chunks, get_knowledge_chunks_by_ids
 from folders import folder_map, list_folders
 from reranker import get_reranker, rerank, reranker_enabled, reranker_status
+from safe_strings import safe_exception_message
 
-_lock = threading.Lock()
+log_embed = logging.getLogger("rag.embed")
+log_retrieve = logging.getLogger("rag.retrieve")
+
+# 锁策略:
+# - 写入(改 collection 内容)持 collection 级别锁,不同 collection 之间互不阻塞。
+# - 读取不持锁,Chroma 的 PersistentClient 内部已线程安全。
+# - 模型加载仍然单飞(_model_lock),但 embedding 函数本身无状态,推理可并发。
+_collection_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
 _model_lock = threading.Lock()
 _client: chromadb.PersistentClient | None = None
 _embedding_function = None
 RRF_K = 60
+
+
+def _lock_for(name: str) -> threading.Lock:
+    """按 collection 名称取得(或惰性创建)独立锁。
+
+    通过 _locks_guard 保护 dict 自身,内部锁对象独立使用。
+    """
+    with _locks_guard:
+        lock = _collection_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _collection_locks[name] = lock
+        return lock
 
 
 def collection_name(user_id: int, folder_key: str) -> str:
@@ -83,9 +106,9 @@ def get_embedding_function():
             )
             if device.startswith("cuda"):
                 used = torch.cuda.memory_allocated(0) / 1024 / 1024
-                print(f"[EMBED] 已加载 {EMBEDDING_MODEL} ({device}, {used:.0f} MiB)", flush=True)
+                log_embed.info("已加载 %s (%s, %.0f MiB)", EMBEDDING_MODEL, device, used)
             else:
-                print(f"[EMBED] 已加载 {EMBEDDING_MODEL} ({device})", flush=True)
+                log_embed.info("已加载 %s (%s)", EMBEDDING_MODEL, device)
             _embedding_function = function
     return _embedding_function
 
@@ -95,12 +118,12 @@ def warmup_models() -> None:
     try:
         get_embedding_function()
         if not reranker_enabled():
-            print("[RERANK] 已禁用（环境变量 RERANKER_ENABLED=0）。删除该变量后重启即可启用。", flush=True)
+            log_embed.info("[RERANK] 已禁用（环境变量 RERANKER_ENABLED=0）。删除该变量后重启即可启用。")
             return
         get_reranker()
-        print(f"[RERANK] 状态: {reranker_status()}", flush=True)
-    except Exception as exc:
-        print(f"[WARN] 模型预加载失败: {exc}", flush=True)
+        log_embed.info("[RERANK] 状态: %s", reranker_status())
+    except Exception as exc:  # noqa: BLE001
+        log_embed.warning("模型预加载失败: %s", safe_exception_message(exc))
 
 
 def get_collection(user_id: int, dept: str):
@@ -125,10 +148,12 @@ def collection_count(user_id: int) -> int:
 
 
 def delete_collection_by_name(name: str) -> None:
-    try:
-        get_chroma_client().delete_collection(name)
-    except Exception:
-        pass
+    """删除指定 collection。持 collection 锁,防止与同名 collection 的写入并发。"""
+    with _lock_for(name):
+        try:
+            get_chroma_client().delete_collection(name)
+        except Exception:
+            pass
 
 
 def _write(user_id: int, dept: str, texts: list[str], ids: list[str], metadatas: list[dict] | None) -> None:
@@ -150,11 +175,14 @@ def replace_documents(
     ids: list[str],
     metadatas: list[dict] | None = None,
 ) -> int:
-    """清空该部门后重建向量索引。"""
+    """清空该部门后重建向量索引。
+
+    持 collection 级别锁,与其他 collection 的索引重建互不阻塞。
+    """
     if texts:
         get_embedding_function()
-    with _lock:
-        name = collection_name(user_id, dept)
+    name = collection_name(user_id, dept)
+    with _lock_for(name):
         client = get_chroma_client()
         try:
             client.delete_collection(name)
@@ -170,10 +198,11 @@ def delete_folder_collection(user_id: int, folder_key: str) -> None:
 
 
 def delete_legacy_collection() -> None:
-    try:
-        get_chroma_client().delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
+    with _lock_for(COLLECTION_NAME):
+        try:
+            get_chroma_client().delete_collection(COLLECTION_NAME)
+        except Exception:
+            pass
 
 
 def _make_hit(dept: str, dept_name: str, chunk_id: str, content: str, meta: dict | None, distance=None) -> dict:
@@ -242,11 +271,17 @@ def _unique_queries(queries: list[str]) -> list[str]:
 
 def _log_hits(query: str, hits: list[dict], reranked: bool) -> None:
     mode = "重排" if reranked else "融合"
-    print(f"[RETRIEVE] query={query[:80]!r} 返回 {len(hits)} 条（{mode}）", flush=True)
-    for hit in hits:
+    log_retrieve.info("命中数=%d 模式=%s query=%r", len(hits), mode, query[:80])
+    for hit in hits[:5]:
         score = hit.get("rerank_score", hit.get("fusion_score"))
         channels = "+".join(sorted(hit.get("channels") or []))
-        print(f"  - {score:.4f} [{channels}] {hit['source']} | {' '.join(hit['content'].split())[:60]}", flush=True)
+        log_retrieve.debug(
+            " - %.4f [%s] %s | %s",
+            score,
+            channels,
+            hit["source"],
+            " ".join(hit["content"].split())[:60],
+        )
 
 
 def search_departments(
@@ -272,30 +307,31 @@ def search_departments(
 
     pool: dict[str, dict] = {}
     pending: list[tuple[str, int]] = []
-    with _lock:
-        client = get_chroma_client()
-        for dept in targets:
-            try:
-                count = client.get_collection(collection_name(user_id, dept)).count()
-            except Exception:
-                continue
-            if count:
-                pending.append((dept, count))
+    # 读操作不持全局锁:Chromadb PersistentClient 内部已线程安全。
+    # 仅写入路径(replace_documents / delete_collection_by_name)按 collection 加锁。
+    client = get_chroma_client()
+    for dept in targets:
+        try:
+            count = client.get_collection(collection_name(user_id, dept)).count()
+        except Exception:
+            continue
+        if count:
+            pending.append((dept, count))
 
-        if pending:
-            query_embeddings = get_embedding_function()(queries)
-            for dept, count in pending:
-                dept_name = catalog[dept].get("name", dept)
-                weight = 1.0 if not routed or dept in routed else UNROUTED_FOLDER_WEIGHT
-                limit = min(RECALL_K, count)
-                collection = get_collection(user_id, dept)
-                results = collection.query(
-                    query_embeddings=query_embeddings,
-                    n_results=limit,
-                    include=["documents", "metadatas", "distances"],
-                )
-                for position, _query in enumerate(queries):
-                    _fuse(pool, _vector_hits(dept, dept_name, results, position), weight, "vector")
+    if pending:
+        query_embeddings = get_embedding_function()(queries)
+        for dept, count in pending:
+            dept_name = catalog[dept].get("name", dept)
+            weight = 1.0 if not routed or dept in routed else UNROUTED_FOLDER_WEIGHT
+            limit = min(RECALL_K, count)
+            collection = get_collection(user_id, dept)
+            results = collection.query(
+                query_embeddings=query_embeddings,
+                n_results=limit,
+                include=["documents", "metadatas", "distances"],
+            )
+            for position, _query in enumerate(queries):
+                _fuse(pool, _vector_hits(dept, dept_name, results, position), weight, "vector")
 
     # 关键词通道直接查规范化知识单元 + FTS5（不依赖 Chroma）
     for query in queries:
@@ -311,23 +347,61 @@ def search_departments(
     candidates = sorted(pool.values(), key=lambda hit: hit["fusion_score"], reverse=True)[:RERANK_CANDIDATES]
     try:
         ranked = rerank(queries[0], candidates, n_results)
-    except Exception as exc:
-        print(f"[WARN] 重排失败，改用融合排序: {exc}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        log_retrieve.warning("重排失败,改用融合排序: %s", safe_exception_message(exc))
         ranked = None
     hits = ranked if ranked is not None else candidates[:n_results]
     if NEIGHBOR_EXPAND > 0 and hits:
-        with _lock:
-            hits = _expand_neighbors(user_id, hits)
-    print(
-        f"[TIMING] 召回 {recalled_at - started_at:.2f}s（{len(pending)} 个向量库，{len(candidates)} 个候选）"
-        f" | 重排 {time.perf_counter() - recalled_at:.2f}s",
-        flush=True,
+        # 读路径,不持锁
+        hits = _expand_neighbors(user_id, hits)
+    # 动态收敛:按总字符数累加,达 MAX_CONTEXT_CHARS 即停。
+    # 优先保证重排靠前的片段完整,后面按顺序截断。
+    truncated, kept_chars = _truncate_by_chars(hits, MAX_CONTEXT_CHARS)
+    if len(truncated) < len(hits):
+        log_retrieve.info(
+            "上下文按字符收敛: %d → %d 块 (累计 %d 字符, 上限 %d)",
+            len(hits), len(truncated), kept_chars, MAX_CONTEXT_CHARS,
+        )
+    hits = truncated
+    log_retrieve.info(
+        "召回耗时 %.2fs (%d 个向量库, %d 个候选) | 重排 %.2fs",
+        recalled_at - started_at,
+        len(pending),
+        len(candidates),
+        time.perf_counter() - recalled_at,
     )
     _log_hits(queries[0], hits, ranked is not None)
     for hit in hits:
         hit["channels"] = sorted(hit.get("channels") or [])
     return hits
 
+
+def _truncate_by_chars(hits: list[dict], max_chars: int) -> tuple[list[dict], int]:
+    """按总字符数累加,达到 max_chars 即停。返回 (裁剪后列表, 实际字符数)。
+
+    - 优先保留排在前面的(hits 已是重排后顺序)
+    - 单条内容 > 剩余预算时:截断到剩余,标记 "(已截断)"
+    - max_chars <= 0 视为不限制
+    """
+    if max_chars <= 0:
+        return list(hits), sum(len(h.get("content") or "") for h in hits)
+    selected: list[dict] = []
+    used = 0
+    for hit in hits:
+        content = hit.get("content") or ""
+        length = len(content)
+        if used + length <= max_chars:
+            selected.append(hit)
+            used += length
+            continue
+        # 放不下了;剩余预算够则截断后放
+        remaining = max_chars - used
+        if remaining > 0:
+            hit = {**hit, "content": content[:remaining] + "\n…(已截断)"}
+            selected.append(hit)
+            used += remaining
+        break
+    return selected, used
 
 def _chunk_prefix_and_index(hit: dict) -> tuple[str | None, int | None]:
     raw_id = str(hit.get("id") or "").split(":", 1)[-1]

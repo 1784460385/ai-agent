@@ -6,6 +6,7 @@ summary_last_history_id 指向已纳入摘要的最后一条 chat_history.id。
 
 import asyncio
 import json
+import logging
 
 from openai import AsyncOpenAI
 
@@ -13,11 +14,14 @@ from config import (
     DEEPSEEK_BASE_URL,
     DEFAULT_MODEL,
     RECENT_CONTEXT_TURNS,
+    SUMMARY_MODEL,
     SUMMARY_TRIGGER_TOKENS,
     SUMMARY_TRIGGER_TURNS,
 )
-from database import SessionLocal
+from db_lock import db_session
 from models_db import ChatHistory, Conversation, utcnow
+
+_log = logging.getLogger(__name__)
 
 SUMMARY_PROMPT = """你是对话摘要器。请把“已有摘要”和“新增对话”合并成更新后的摘要。
 
@@ -110,8 +114,8 @@ def _lock_for(conversation_id: int) -> asyncio.Lock:
 
 
 def _load_state(user_id: int, conversation_id: int) -> tuple[list[ChatHistory], str, int]:
-    db = SessionLocal()
-    try:
+    """同步读路径(由 asyncio.to_thread 包装)。返回摘要 + 增量 chat_history 行。"""
+    with db_session() as db:
         thread = (
             db.query(Conversation)
             .filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
@@ -125,19 +129,29 @@ def _load_state(user_id: int, conversation_id: int) -> tuple[list[ChatHistory], 
             .order_by(ChatHistory.id.asc())
             .all()
         )
+        # 在 session 关闭前把所有字段拷贝到本地,避免延迟属性访问跨 session 报错
+        result: list[ChatHistory] = []
         for row in rows:
-            _ = (row.id, row.question, row.answer, row.attachments)
-            db.expunge(row)
+            detached = ChatHistory(
+                id=row.id,
+                user_id=row.user_id,
+                question=row.question,
+                answer=row.answer,
+                router_departments=row.router_departments,
+                citations=row.citations,
+                attachments=row.attachments,
+                conversation_id=row.conversation_id,
+                created_at=row.created_at,
+            )
+            result.append(detached)
         summary = thread.summary or ""
         last_id = int(thread.summary_last_history_id or 0)
-        return rows, summary, last_id
-    finally:
-        db.close()
+        return result, summary, last_id
 
 
 def _save_summary(user_id: int, conversation_id: int, summary: str, last_history_id: int) -> None:
-    db = SessionLocal()
-    try:
+    """落库摘要 + 维护 summary_last_history_id。"""
+    with db_session() as db:
         thread = (
             db.query(Conversation)
             .filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
@@ -148,9 +162,6 @@ def _save_summary(user_id: int, conversation_id: int, summary: str, last_history
         thread.summary = summary[:4000]
         thread.summary_last_history_id = last_history_id
         thread.summary_updated_at = utcnow()
-        db.commit()
-    finally:
-        db.close()
 
 
 def _format_turns(rows: list[ChatHistory]) -> str:
@@ -251,11 +262,20 @@ async def prepare_conversation_context(
     api_key: str,
     base_url: str,
     model_name: str,
+    summary_model: str | None = None,
 ) -> dict:
-    """返回拼进主模型的历史消息，以及用于路由和检索的 query。"""
+    """返回拼进主模型的历史消息，以及用于路由和检索的 query。
+
+    - `model_name`:用户为生成侧选的模型(走 chat_service 调用主模型时)
+    - `summary_model`:摘要 / 改写专用模型,默认 config.SUMMARY_MODEL(deepseek-flash)。
+      与生成模型解耦,避免用户为生成选 `deepseek-reasoner` 时,摘要也跟着慢、跟着贵。
+    """
     question = (current_question or "").strip()
     if not conversation_id:
         return {"messages": [], "retrieval_query": question}
+
+    # 解耦:摘要 / 改写固定走 SUMMARY_MODEL,生成模型只用于主对话
+    side_model = summary_model or SUMMARY_MODEL
 
     async def refresh() -> tuple[str, list[ChatHistory], list[ChatHistory]]:
         rows, summary, last_id = await asyncio.to_thread(_load_state, user_id, conversation_id)
@@ -268,20 +288,20 @@ async def prepare_conversation_context(
             summary, pending, recent = await refresh()
             if _should_summarize(pending):
                 try:
-                    summary = await _summarize(api_key, base_url, model_name, summary, pending)
+                    summary = await _summarize(api_key, base_url, side_model, summary, pending)
                     last_id = pending[-1].id
                     await asyncio.to_thread(_save_summary, user_id, conversation_id, summary, last_id)
                     pending = []
-                except Exception as exc:
-                    print(f"[WARN] 对话摘要失败: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("对话摘要失败: %s", exc)
                     pending = _trim_pending(pending)
 
     retrieval_query = question
     if summary or recent:
         try:
-            retrieval_query = await _rewrite_query(api_key, base_url, model_name, question, summary, recent)
-        except Exception as exc:
-            print(f"[WARN] 检索查询改写失败: {exc}")
+            retrieval_query = await _rewrite_query(api_key, base_url, side_model, question, summary, recent)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("检索查询改写失败: %s", exc)
             retrieval_query = _fallback_query(question, recent)
 
     messages: list[dict] = []

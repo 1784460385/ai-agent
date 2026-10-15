@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -6,6 +7,8 @@ import urllib.request
 from pathlib import Path
 
 from config import BASE_DIR
+
+_log = logging.getLogger("rag.io")
 
 HUB_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
 SKIP_PREFIXES = ("imgs/", "onnx/", ".")
@@ -79,18 +82,20 @@ def _download(url: str, dest: Path) -> None:
                         downloaded += len(chunk)
                         if downloaded - next_report >= 8 * 1024 * 1024 or (total and downloaded >= total):
                             if total:
-                                print(
-                                    f"[model] {dest.name} {downloaded / 1024 / 1024:.0f}/{total / 1024 / 1024:.0f} MB",
-                                    flush=True,
+                                _log.info(
+                                    "%s %d/%d MB",
+                                    dest.name,
+                                    int(downloaded / 1024 / 1024),
+                                    int(total / 1024 / 1024),
                                 )
                             else:
-                                print(f"[model] {dest.name} {downloaded / 1024 / 1024:.0f} MB", flush=True)
+                                _log.info("%s %d MB", dest.name, int(downloaded / 1024 / 1024))
                             next_report = downloaded
             break
         except (TimeoutError, urllib.error.URLError) as exc:
             if attempt == 2:
                 raise RuntimeError(f"下载失败: {dest.name}") from exc
-            print(f"[model] {dest.name} 下载中断，正在重试 ({attempt + 1}/3)", flush=True)
+            _log.info("%s 下载中断,正在重试 (%d/3)", dest.name, attempt + 1)
 
     part.replace(dest)
 
@@ -120,10 +125,10 @@ def ensure_local_model(model_id: str) -> str:
 
     dest = BASE_DIR / "models" / model_id
     if _local_ready(dest, model_id):
-        print(f"[model] 使用本地模型 {dest}", flush=True)
+        _log.info("使用本地模型 %s", dest)
         return str(dest)
 
-    print(f"[model] 准备模型 {model_id} -> {dest}", flush=True)
+    _log.info("准备模型 %s -> %s", model_id, dest)
     for name in _hub_files(model_id):
         target = dest / name
         if target.exists() and target.stat().st_size > 0:

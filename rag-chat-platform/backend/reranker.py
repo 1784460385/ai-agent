@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import threading
 
 from config import RERANK_MIN_SCORE, RERANKER_ENABLED, RERANKER_MODEL
 from devices import empty_cuda_cache, reranker_device
+from safe_strings import safe_exception_message
+
+_log = logging.getLogger("rag.embed")
 
 _load_lock = threading.Lock()
 _predict_lock = threading.Lock()
@@ -67,14 +71,17 @@ def get_reranker():
                 model = _load_on(device)
                 _model = model
                 _loaded_device = device
-                print(f"[RERANK] 已加载 {RERANKER_MODEL} ({device})", flush=True)
+                _log.info("已加载 %s (%s)", RERANKER_MODEL, device)
                 return _model
             except Exception as exc:
                 last_error = exc
                 empty_cuda_cache()
-                print(f"[WARN] 重排模型在 {device} 加载失败: {exc}", flush=True)
+                _log.warning("重排模型在 %s 加载失败: %s", device, safe_exception_message(exc))
         _load_failed = True
-        print(f"[WARN] 重排模型不可用，改用融合排序: {last_error}", flush=True)
+        _log.warning(
+            "重排模型不可用,改用融合排序: %s",
+            safe_exception_message(last_error) if last_error else "未知",
+        )
     return _model
 
 

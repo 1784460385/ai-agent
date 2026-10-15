@@ -1,0 +1,6 @@
+# 开发与测试依赖(与 requirements.txt 分离)
+# 安装: pip install -r requirements-dev.txt
+pytest>=8.0.0
+pytest-cov>=5.0.0
+ruff>=0.5.0
+mypy>=1.10.0

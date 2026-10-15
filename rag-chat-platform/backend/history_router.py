@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import SessionLocal, get_db
+from db_lock import db_session
 from models_db import ChatHistory, Conversation, User, utcnow
 
 router = APIRouter(prefix="/api/history", tags=["history"])
@@ -49,8 +50,8 @@ def save_chat_history(
     conversation_id: int,
     attachments: list | None = None,
 ) -> None:
-    db = SessionLocal()
-    try:
+    """落库对话 + 更新 Conversation.updated_at。异常向上抛以便上层日志。"""
+    with db_session() as db:
         db.add(
             ChatHistory(
                 user_id=user_id,
@@ -65,14 +66,11 @@ def save_chat_history(
         thread = db.query(Conversation).filter(Conversation.id == conversation_id).first()
         if thread is not None:
             thread.updated_at = utcnow()
-        db.commit()
-    finally:
-        db.close()
 
 
 def open_conversation(user_id: int, conversation_id: int | None, question: str) -> dict:
-    db = SessionLocal()
-    try:
+    """开新对话 / 续聊开口。失败时抛 LookupError 或 IntegrityError 让上游处理。"""
+    with db_session() as db:
         if conversation_id is not None:
             thread = (
                 db.query(Conversation)
@@ -85,16 +83,13 @@ def open_conversation(user_id: int, conversation_id: int | None, question: str) 
         title = " ".join(question.split())[:32] or "新对话"
         thread = Conversation(user_id=user_id, title=title)
         db.add(thread)
-        db.commit()
+        db.flush()
         db.refresh(thread)
         return {"id": thread.id, "title": thread.title, "updated_at": _iso(thread.updated_at)}
-    finally:
-        db.close()
 
 
 def backfill_conversations() -> None:
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         rows = db.query(ChatHistory).filter(ChatHistory.conversation_id.is_(None)).all()
         for row in rows:
             title = " ".join((row.question or "").split())[:32] or "新对话"
@@ -107,9 +102,6 @@ def backfill_conversations() -> None:
             db.add(thread)
             db.flush()
             row.conversation_id = thread.id
-        db.commit()
-    finally:
-        db.close()
 
 
 def _thread_item(thread: Conversation) -> dict:
@@ -117,10 +109,10 @@ def _thread_item(thread: Conversation) -> dict:
 
 
 def prior_messages(user_id: int, conversation_id: int | None) -> list[dict]:
+    """加载最近 N 轮历史,组装成 OpenAI messages 格式。读路径,只读事务。"""
     if conversation_id is None:
         return []
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         rows = (
             db.query(ChatHistory)
             .filter(ChatHistory.user_id == user_id, ChatHistory.conversation_id == conversation_id)
@@ -128,8 +120,6 @@ def prior_messages(user_id: int, conversation_id: int | None) -> list[dict]:
             .limit(6)
             .all()
         )
-    finally:
-        db.close()
     messages = []
     for row in reversed(rows):
         text = row.question or ""

@@ -1,4 +1,5 @@
-import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
+import { useEffect } from 'react';
+import { Navigate, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { AuthProvider } from './auth/AuthContext';
 import { Navbar } from './components/layout/Navbar';
 import { AdminRoute, PrivateRoute } from './components/PrivateRoute';
@@ -7,6 +8,7 @@ import { ChatPage } from './pages/ChatPage';
 import { ApiKeysPage } from './pages/ApiKeysPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { LoginPage } from './pages/LoginPage';
+import { authEvents } from './lib/authEvents';
 
 function Shell() {
   return (
@@ -19,9 +21,23 @@ function Shell() {
   );
 }
 
+function GlobalAuthListener() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  useEffect(() => {
+    return authEvents.on('expired', () => {
+      if (!location.pathname.startsWith('/login')) {
+        navigate('/login', { replace: true });
+      }
+    });
+  }, [navigate, location.pathname]);
+  return null;
+}
+
 export default function App() {
   return (
     <AuthProvider>
+      <GlobalAuthListener />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route element={<PrivateRoute />}>

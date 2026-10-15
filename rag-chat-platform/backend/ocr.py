@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import threading
 from typing import Any
 
@@ -11,6 +12,7 @@ from PIL import Image
 
 from config import OCR_ENABLED, OCR_MAX_IMAGE_PIXELS
 
+_log = logging.getLogger("rag.io")
 _lock = threading.Lock()
 _engine = None
 
@@ -34,7 +36,7 @@ def get_ocr_engine():
             from rapidocr import RapidOCR
 
             _engine = RapidOCR()
-            print("[OCR] RapidOCR 已加载", flush=True)
+            _log.info("RapidOCR 已加载")
     return _engine
 
 

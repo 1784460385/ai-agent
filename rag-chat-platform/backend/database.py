@@ -1,4 +1,29 @@
+
+
+"""SQLite + SQLAlchemy 双栈数据库层。
+
+设计目标(对应"统一 DB"重构)
+============================
+
+* :mod:`db_lock` 提供**业务层 RW 锁 + ORM session context manager**。
+  推荐新建代码用 ``from db_lock import db_session, db_locks``。
+* 老代码继续用本模块的 ``db()`` 裸 sqlite3 上下文和 ``SessionLocal``。
+  二者共用同一 SQLite 文件(WAL 模式),所以跨栈读写不冲突。
+* 模块级 ``_lock`` 暂保留为单一进程级 fallback;新的细粒度锁应通过
+  :data:`db_lock.db_locks` 取,逐步替换 _lock 使用。
+
+模块暴露
+========
+
+* ``engine`` / ``SessionLocal`` / ``Base`` —— SQLAlchemy 入口
+* ``get_db()`` —— FastAPI 路由 ``Depends`` 用 SQLAlchemy
+* ``db()`` —— 上下文管理器,裸 sqlite3 + 单连接事务
+* ``init_db()`` —— 首次启动建表 + ALTER TABLE 列检查
+"""
+
 import json
+import logging
+import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -10,9 +35,19 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config import ALLOWED_SUFFIXES, KNOWLEDGE_BASE_DIR, sqlite_path
 
+_log = logging.getLogger(__name__)
+
+# SQLAlchemy 引擎:SQLite + WAL。WAL 模式下读写不互斥,业务裸 sqlite3
+# 共用同一文件不会冲突(只看 journal_mode)。
 engine = create_engine(
     "sqlite:///" + sqlite_path().resolve().as_posix(),
-    connect_args={"check_same_thread": False},
+    connect_args={
+        "check_same_thread": False,
+        "timeout": int(os.getenv("SQLITE_TIMEOUT", "30")),
+    },
+    pool_size=int(os.getenv("SQLALCHEMY_POOL_SIZE", "5")),
+    max_overflow=int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", "10")),
+    pool_pre_ping=True,
 )
 
 
@@ -23,14 +58,35 @@ def _enable_foreign_keys(dbapi_connection, _connection_record) -> None:
     cursor.close()
 
 
+@event.listens_for(engine, "connect")
+def _enable_wal(dbapi_connection, _connection_record) -> None:
+    """SQLAlchemy 连接也开 WAL,确保与裸 sqlite3 协调。"""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
 
+# 兼容旧 API(保留 `from database import get_db` 工作)
 def get_db():
+    """FastAPI 路由依赖注入接口(向上层以 generator 形式 yield Session)。
+
+    新代码请用 :func:`db_lock.db_session`。
+    """
     session = SessionLocal()
     try:
         yield session
+        session.commit()
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            _log.exception("SQLAlchemy rollback 失败")
+        raise
     finally:
         session.close()
 
@@ -40,6 +96,8 @@ def create_orm_tables() -> None:
 
     Base.metadata.create_all(bind=engine)
 
+
+# ---- 进程级 fallback 锁(老代码 db() 内部使用) ----
 _lock = threading.RLock()
 _ready = False
 
@@ -658,7 +716,7 @@ def fts_search_chunks(
         with db() as conn:
             rows = conn.execute(sql, (user_id, *folder_keys, match_expr, limit)).fetchall()
     except sqlite3.OperationalError as exc:
-        print(f"[WARN] FTS5 查询失败: {exc}")
+        _log.warning("FTS5 查询失败: %s", exc)
         return []
     results = []
     for row in rows:

@@ -3,6 +3,30 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# ---- 环境变量默认值集中声明 ----
+# 必须在导入 HuggingFace / Chroma 之前生效,所以模块 import 时立即设置:
+_APPLY_ENV_DEFAULTS: dict[str, str] = {
+    # 关闭 HF 的 Xet 大文件下载,避免停在 0 字节
+    "HF_HUB_DISABLE_XET": "1",
+    "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
+    # Chroma 遥测
+    "ANONYMIZED_TELEMETRY": "False",
+    "TOKENIZERS_PARALLELISM": "false",
+}
+
+
+def apply_env() -> None:
+    """一次性设置所有运行时环境变量默认值(只 setdefault,不覆盖已设)。
+
+    应在 main.py / conftest.py 等 import 业务模块之前调用。
+    后续业务代码统一用 :func:`os.getenv` 读取,默认值在每个常量定义处显式给出。
+    """
+    for key, value in _APPLY_ENV_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+
+
+apply_env()  # 模块 import 时立即生效,任何 `import config` 之后所有常量均拿到安全默认值
+
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "chroma_db"))
 KNOWLEDGE_BASE_DIR = os.getenv("KNOWLEDGE_BASE_DIR", str(BASE_DIR / "knowledge_base"))
 
@@ -47,8 +71,11 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "8"))
 # 命中片段时前后各扩展几块，避免「职责」类列表被切散后只答一部分
 NEIGHBOR_EXPAND = int(os.getenv("NEIGHBOR_EXPAND", "1"))
-# 扩展后拼进 prompt 的上限
+# 扩展后拼进 prompt 的上限(块数硬上限,作为最后一道保护)
 MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "12"))
+# 拼进 prompt 的总字符上限(中文字符计数,近似 1.5 个 token)
+# 触发收敛的硬阈值;同时受 MAX_CONTEXT_CHUNKS 块数限制
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "3500"))
 # 每个文件夹、每路检索（向量 / 关键词）的召回数
 RECALL_K = int(os.getenv("RECALL_K", "20"))
 # 融合后送进重排模型的候选数（CPU 重排时建议不要太大）
@@ -71,6 +98,9 @@ SUMMARY_TRIGGER_TOKENS = int(os.getenv("SUMMARY_TRIGGER_TOKENS", "800"))
 SUMMARY_TRIGGER_TURNS = int(os.getenv("SUMMARY_TRIGGER_TURNS", "2"))
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek-flash")
+# 摘要 / 改写专用模型:与生成模型解耦,避免用户在生成侧选了 deepseek-reasoner
+# 后,摘要也跟着慢 / 跟着贵。默认 deepseek-flash,可通过环境变量覆盖。
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "deepseek-flash")
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 OFFICE_MAX_BYTES = int(os.getenv("OFFICE_MAX_BYTES", str(50 * 1024 * 1024)))

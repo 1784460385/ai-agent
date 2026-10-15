@@ -1,5 +1,5 @@
-import { createParser, type EventSourceMessage } from 'eventsource-parser';
-import { ApiError, http, TOKEN_KEY, clearSession } from './http';
+import { ApiError, TOKEN_KEY, http } from './http';
+import { streamChatEvents } from '../lib/sse';
 
 export { ApiError };
 
@@ -100,18 +100,36 @@ export type ChatEvent =
   | { type: 'done' }
   | { type: 'error'; message: string };
 
-async function readError(response: Response, fallback: string): Promise<string> {
-  try {
-    const body = await response.json();
-    const detail = body?.detail;
-    if (typeof detail === 'string') return detail;
-    if (Array.isArray(detail)) {
-      return detail.map((item) => item?.msg || JSON.stringify(item)).join('；');
-    }
-  } catch {
-    /* 非 JSON 错误体 */
+function asChatEvent(evt: { type: string; [k: string]: unknown }): ChatEvent {
+  switch (evt.type) {
+    case 'conversation':
+      return {
+        type: 'conversation',
+        id: Number(evt.id),
+        title: String(evt.title ?? ''),
+      };
+    case 'router':
+      return {
+        type: 'router',
+        via: evt.via === 'llm' ? 'llm' : 'rule',
+        departments: Array.isArray(evt.departments)
+          ? (evt.departments as { key: string; name: string }[])
+          : [],
+      };
+    case 'sources':
+      return {
+        type: 'sources',
+        sources: Array.isArray(evt.sources) ? (evt.sources as SourceItem[]) : [],
+      };
+    case 'delta':
+      return { type: 'delta', content: String(evt.content ?? '') };
+    case 'done':
+      return { type: 'done' };
+    case 'error':
+      return { type: 'error', message: String(evt.message ?? '未知错误') };
+    default:
+      return { type: 'delta', content: JSON.stringify(evt) };
   }
-  return fallback;
 }
 
 export async function createFolder(name: string): Promise<{ key: string; name: string }> {
@@ -119,7 +137,10 @@ export async function createFolder(name: string): Promise<{ key: string; name: s
   return data;
 }
 
-export async function renameFolder(folderKey: string, name: string): Promise<{ key: string; name: string }> {
+export async function renameFolder(
+  folderKey: string,
+  name: string
+): Promise<{ key: string; name: string }> {
   const { data } = await http.patch(`/api/folders/${encodeURIComponent(folderKey)}`, { name });
   return data;
 }
@@ -134,7 +155,9 @@ export async function fetchConfig(): Promise<AppConfig> {
 }
 
 export async function retryParse(department: string, filename: string): Promise<void> {
-  await http.post(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/retry`);
+  await http.post(
+    `/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/retry`
+  );
 }
 
 export async function uploadDocument(
@@ -152,8 +175,15 @@ export async function deleteDocument(department: string, filename: string): Prom
   await http.delete(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}`);
 }
 
-export async function moveDocument(department: string, filename: string, target: string): Promise<void> {
-  await http.post(`/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/move`, { target });
+export async function moveDocument(
+  department: string,
+  filename: string,
+  target: string
+): Promise<void> {
+  await http.post(
+    `/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/move`,
+    { target }
+  );
 }
 
 export interface DocumentPreview {
@@ -163,7 +193,10 @@ export interface DocumentPreview {
   size: number;
 }
 
-export async function previewDocument(department: string, filename: string): Promise<DocumentPreview> {
+export async function previewDocument(
+  department: string,
+  filename: string
+): Promise<DocumentPreview> {
   const { data } = await http.get(
     `/api/documents/${encodeURIComponent(department)}/${encodeURIComponent(filename)}/preview`
   );
@@ -179,7 +212,9 @@ export async function fetchDocumentContent(department: string, filename: string)
 }
 
 export async function rebuildIndex(department?: string): Promise<IndexResponse> {
-  const { data } = await http.post('/api/index', null, { params: department ? { department } : {} });
+  const { data } = await http.post('/api/index', null, {
+    params: department ? { department } : {},
+  });
   return data;
 }
 
@@ -199,7 +234,9 @@ export async function fetchStats(): Promise<number> {
 }
 
 export async function listConversations(keyword = ''): Promise<ConversationSummary[]> {
-  const { data } = await http.get('/api/conversations', { params: { keyword: keyword || undefined } });
+  const { data } = await http.get('/api/conversations', {
+    params: { keyword: keyword || undefined },
+  });
   return data.items ?? [];
 }
 
@@ -212,12 +249,19 @@ export async function deleteConversation(id: number): Promise<void> {
   await http.delete(`/api/conversations/${id}`);
 }
 
-export async function listUsers(page: number, size = 20): Promise<{ total: number; page: number; size: number; items: AccountUser[] }> {
+export async function listUsers(
+  page: number,
+  size = 20
+): Promise<{ total: number; page: number; size: number; items: AccountUser[] }> {
   const { data } = await http.get('/api/admin/users', { params: { page, size } });
   return data;
 }
 
-export async function createUser(payload: { username: string; password: string; role: 'admin' | 'user' }): Promise<AccountUser> {
+export async function createUser(payload: {
+  username: string;
+  password: string;
+  role: 'admin' | 'user';
+}): Promise<AccountUser> {
   const { data } = await http.post('/api/admin/users', payload);
   return data;
 }
@@ -235,7 +279,10 @@ export async function deleteUser(id: number): Promise<void> {
 }
 
 export async function changePassword(oldPassword: string, newPassword: string): Promise<void> {
-  await http.post('/api/auth/change-password', { old_password: oldPassword, new_password: newPassword });
+  await http.post('/api/auth/change-password', {
+    old_password: oldPassword,
+    new_password: newPassword,
+  });
 }
 
 export async function listApiKeys(): Promise<ApiKeyItem[]> {
@@ -270,6 +317,7 @@ export async function setDefaultApiKey(id: number): Promise<ApiKeyItem> {
   return data;
 }
 
+/** 调用方决定 401 时怎么跳转;本函数只负责把服务端事件透传给 onEvent(类型收窄为 ChatEvent)。 */
 export async function streamChat(
   message: string,
   config: ModelConfig,
@@ -278,52 +326,25 @@ export async function streamChat(
   conversationId?: number | null,
   files: File[] = []
 ): Promise<void> {
-  const token = localStorage.getItem(TOKEN_KEY);
   const form = new FormData();
   form.append('message', message);
   form.append('api_key_id', String(config.api_key_id));
   if (conversationId) form.append('conversation_id', String(conversationId));
   files.forEach((file) => form.append('files', file));
-  const response = await fetch('/api/chat', {
+
+  for await (const evt of streamChatEvents('/api/chat', {
     method: 'POST',
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
+    headers: { Authorization: `Bearer ${localStorage.getItem(TOKEN_KEY) ?? ''}` },
     body: form,
     signal,
-  });
-
-  if (!response.ok) {
-    const fallback = response.status === 401 ? '登录已失效，请重新登录' : `请求失败 (${response.status})`;
-    const messageText = await readError(response, fallback);
-    if (response.status === 401 && (messageText.includes('凭证') || messageText.includes('禁用') || messageText.includes('不存在'))) {
-      clearSession();
-      window.location.assign('/login');
+    idleTimeoutMs: 180_000, // 大模型长链路
+  })) {
+    const chatEvent = asChatEvent(evt);
+    onEvent(chatEvent);
+    if (chatEvent.type === 'done' || chatEvent.type === 'error') {
+      return;
     }
-    throw new ApiError(response.status, messageText);
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) {
-    throw new Error('浏览器不支持流式读取');
-  }
-
-  const decoder = new TextDecoder();
-  const parser = createParser({
-    onEvent(event: EventSourceMessage) {
-      const data = event.data?.trim();
-      if (!data || data === '[DONE]') return;
-      try {
-        onEvent(JSON.parse(data) as ChatEvent);
-      } catch {
-        onEvent({ type: 'delta', content: data });
-      }
-    },
-  });
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parser.feed(decoder.decode(value, { stream: true }));
   }
 }
+
+export { http } from './http';

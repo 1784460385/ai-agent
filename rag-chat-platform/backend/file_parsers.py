@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +10,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from openpyxl import load_workbook
 from pptx import Presentation
+
+_log = logging.getLogger("rag.io")
 
 from config import (
     IMAGE_SUFFIXES,
@@ -91,7 +94,7 @@ def _ocr_bytes(data: bytes) -> str:
     try:
         return ocr_image_bytes(data)
     except OcrError as exc:
-        print(f"[WARN] OCR 跳过: {exc}", flush=True)
+        _log.warning("OCR 跳过: %s", exc)
         return ""
 
 
@@ -164,8 +167,8 @@ def _enrich_pdf_with_ocr(path: Path, documents: list[Document]) -> list[Document
 
     try:
         pdf = fitz.open(str(path))
-    except Exception as exc:
-        print(f"[WARN] PDF OCR 打开失败: {exc}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("PDF OCR 打开失败: %s", exc)
         return documents
 
     enriched: list[Document] = []

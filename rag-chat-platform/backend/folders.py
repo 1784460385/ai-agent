@@ -1,11 +1,15 @@
 import hashlib
 import json
+import logging
 import re
 import threading
 from pathlib import Path
 
 from config import KNOWLEDGE_BASE_DIR
 from database import delete_folder_row, get_folder, insert_folder, list_folders, sync_catalog, update_folder_meta
+from route_cache import route_cache_invalidate_user
+
+_log = logging.getLogger("rag.router")
 
 LEGACY_FOLDERS = {
     "finance": {
@@ -113,6 +117,9 @@ def create_folder(user_id: int, name: str) -> dict:
             "collection": _collection_id(user_id, cleaned),
         }
         insert_folder(meta)
+        # 新文件夹会影响后续路由结果,清掉该用户的路由缓存
+        n = route_cache_invalidate_user(user_id)
+        _log.debug("create_folder: 已清掉 %d 条路由缓存 user=%s", n, user_id)
         return meta
 
 
@@ -121,6 +128,8 @@ def delete_folder(user_id: int, folder_key: str) -> None:
         if get_folder(user_id, folder_key) is None:
             raise ValueError("文件夹不存在")
         delete_folder_row(user_id, folder_key)
+        n = route_cache_invalidate_user(user_id)
+        _log.debug("delete_folder: 已清掉 %d 条路由缓存 user=%s", n, user_id)
 
 
 def rename_folder(user_id: int, folder_key: str, name: str) -> dict:
@@ -137,4 +146,7 @@ def rename_folder(user_id: int, folder_key: str, name: str) -> dict:
         updated = get_folder(user_id, folder_key)
         if updated is None:
             raise ValueError("文件夹不存在")
+        # keywords 改了,清掉路由缓存
+        n = route_cache_invalidate_user(user_id)
+        _log.debug("rename_folder: 已清掉 %d 条路由缓存 user=%s", n, user_id)
         return updated
